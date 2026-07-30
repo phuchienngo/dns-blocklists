@@ -56,6 +56,10 @@ validation emit a heartbeat every 30 seconds so a slow or stuck phase remains
 visible in CI logs. Every phase also includes its overall step and percentage;
 the total consists of all sources, DNS validation, and all output files.
 
+DNS validation runs in batches of 10,000 domains. After every batch, the log
+reports cumulative processed, kept, and removed counts. This provides exact
+progress without loading the full domain list into RAM.
+
 ## DNS validation
 
 dnsx queries A and AAAA in stream mode using every resolver configured in

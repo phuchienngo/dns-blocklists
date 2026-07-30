@@ -3,6 +3,7 @@ import tempfile
 import textwrap
 import sqlite3
 import time
+import json
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -122,6 +123,92 @@ class ParseContentTest(unittest.TestCase):
 
 
 class DnsClassificationTest(unittest.TestCase):
+    def test_dnsx_reports_cumulative_batch_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "domains.txt").write_text(
+                "\n".join(
+                    [
+                        "a.example",
+                        "b.example",
+                        "c.example",
+                        "d.example",
+                        "e.example",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config = {
+                "dns": {"resolvers": ["1.1.1.1"]},
+                "sources": [
+                    {
+                        "name": "local",
+                        "category": "adblock",
+                        "format": "domains",
+                        "path": "domains.txt",
+                    }
+                ],
+            }
+            batches: list[list[str]] = []
+
+            def complete_dnsx(_command, **kwargs) -> None:
+                domains = [
+                    line.strip()
+                    for line in kwargs["stdin"]
+                    if line.strip()
+                ]
+                batches.append(domains)
+                for domain in domains:
+                    if domain not in {"b.example", "e.example"}:
+                        kwargs["stdout"].write(
+                            json.dumps(
+                                {
+                                    "host": domain,
+                                    "a": ["192.0.2.1"],
+                                }
+                            )
+                            + "\n"
+                        )
+
+            output = StringIO()
+            with (
+                patch.object(builder, "DNS_BATCH_SIZE", 2, create=True),
+                patch.object(builder.shutil, "which", return_value="/dnsx"),
+                patch.object(
+                    builder.subprocess,
+                    "run",
+                    side_effect=complete_dnsx,
+                ),
+                redirect_stdout(output),
+            ):
+                counts = build(
+                    config=config,
+                    base_directory=root,
+                    output_directory=root / "output",
+                )
+
+            self.assertEqual(
+                batches,
+                [
+                    ["a.example", "b.example"],
+                    ["c.example", "d.example"],
+                    ["e.example"],
+                ],
+            )
+            self.assertEqual(counts, {"adblock": 3})
+            log = output.getvalue()
+            self.assertIn(
+                "[step 2/3 | 67%] DNS batch 1/3 complete: "
+                "processed 2/5 (40.0%), kept 1, removed 1",
+                log,
+            )
+            self.assertIn(
+                "[step 2/3 | 67%] DNS batch 3/3 complete: "
+                "processed 5/5 (100.0%), kept 3, removed 2",
+                log,
+            )
+
     def test_dnsx_streams_a_and_aaaa_through_one_resolver_file(self) -> None:
         with sqlite3.connect(":memory:") as connection:
             builder._initialize_database(connection)

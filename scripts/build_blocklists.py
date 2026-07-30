@@ -34,6 +34,7 @@ DOMAIN_PATTERN = re.compile(
 )
 VALID_SCOPES = {"auto", "host", "suffix"}
 PROGRESS_HEARTBEAT_SECONDS = 30
+DNS_BATCH_SIZE = 10_000
 DomainEmitter = Callable[[str, str], None]
 
 
@@ -365,14 +366,15 @@ def parse_content(
 def _store_dnsx_results(
     connection: sqlite3.Connection,
     lines: Iterable[str],
-) -> None:
+) -> int:
     connection.execute(
         """
-        CREATE TABLE dns_resolved (
+        CREATE TABLE IF NOT EXISTS dns_resolved (
             domain TEXT PRIMARY KEY
         ) WITHOUT ROWID
         """
     )
+    changes_before = connection.total_changes
     rows: list[tuple[str]] = []
     for line_number, raw_line in enumerate(lines, start=1):
         if not raw_line.strip():
@@ -409,6 +411,7 @@ def _store_dnsx_results(
             "INSERT OR IGNORE INTO dns_resolved VALUES (?)",
             rows,
         )
+    return connection.total_changes - changes_before
 
 
 def _remove_unresolved_domains(
@@ -532,6 +535,8 @@ def _merge_source(
 def _validate_dns_database(
     connection: sqlite3.Connection,
     dns_config: dict[str, Any],
+    *,
+    progress_label: str = "",
 ) -> None:
     resolvers = dns_config.get("resolvers")
     if not isinstance(resolvers, list) or not resolvers:
@@ -545,20 +550,23 @@ def _validate_dns_database(
     if not resolved_executable:
         raise RuntimeError(f"dnsx executable not found: {executable}")
 
+    total_domains = connection.execute(
+        "SELECT COUNT(*) FROM (SELECT domain FROM domains GROUP BY domain)"
+    ).fetchone()[0]
+    total_batches = (
+        total_domains + DNS_BATCH_SIZE - 1
+    ) // DNS_BATCH_SIZE
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dns_resolved (
+            domain TEXT PRIMARY KEY
+        ) WITHOUT ROWID
+        """
+    )
+
     with tempfile.TemporaryDirectory(prefix="dns-blocklists-") as directory:
         temporary = Path(directory)
         input_path = temporary / "domains.txt"
-        with input_path.open("w", encoding="utf-8") as input_file:
-            for (domain,) in connection.execute(
-                """
-                SELECT domain
-                FROM domains
-                GROUP BY domain
-                ORDER BY domain
-                """
-            ):
-                input_file.write(f"{domain}\n")
-
         resolver_path = temporary / "resolvers.txt"
         resolver_path.write_text(
             "".join(f"{resolver}\n" for resolver in resolvers),
@@ -584,28 +592,61 @@ def _validate_dns_database(
             "-silent",
             "-disable-update-check",
         ]
-        with (
-            input_path.open(encoding="utf-8") as input_file,
-            output_path.open("w", encoding="utf-8") as output,
-            error_path.open("w", encoding="utf-8") as errors,
-        ):
-            try:
-                subprocess.run(
-                    command,
-                    stdin=input_file,
-                    stdout=output,
-                    stderr=errors,
-                    check=True,
-                    timeout=command_timeout,
-                )
-            except (
-                subprocess.CalledProcessError,
-                subprocess.TimeoutExpired,
-            ) as error:
-                raise RuntimeError("dnsx failed") from error
+        domain_cursor = connection.execute(
+            """
+            SELECT domain
+            FROM domains
+            GROUP BY domain
+            ORDER BY domain
+            """
+        )
+        processed_count = 0
+        kept_count = 0
+        started_at = time.monotonic()
+        batch_index = 0
+        while batch := domain_cursor.fetchmany(DNS_BATCH_SIZE):
+            batch_index += 1
+            with input_path.open("w", encoding="utf-8") as input_file:
+                for (domain,) in batch:
+                    input_file.write(f"{domain}\n")
 
-        with output_path.open(encoding="utf-8") as output:
-            _store_dnsx_results(connection, output)
+            with (
+                input_path.open(encoding="utf-8") as input_file,
+                output_path.open("w", encoding="utf-8") as output,
+                error_path.open("w", encoding="utf-8") as errors,
+            ):
+                try:
+                    subprocess.run(
+                        command,
+                        stdin=input_file,
+                        stdout=output,
+                        stderr=errors,
+                        check=True,
+                        timeout=command_timeout,
+                    )
+                except (
+                    subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired,
+                ) as error:
+                    raise RuntimeError(
+                        f"dnsx failed on batch "
+                        f"{batch_index}/{total_batches}"
+                    ) from error
+
+            with output_path.open(encoding="utf-8") as output:
+                kept_count += _store_dnsx_results(connection, output)
+            processed_count += len(batch)
+            removed_count = processed_count - kept_count
+            percentage = processed_count / total_domains * 100
+            prefix = f"{progress_label} " if progress_label else ""
+            print(
+                f"{prefix}DNS batch {batch_index}/{total_batches} complete: "
+                f"processed {processed_count:,}/{total_domains:,} "
+                f"({percentage:.1f}%), kept {kept_count:,}, "
+                f"removed {removed_count:,}, "
+                f"elapsed {time.monotonic() - started_at:.0f}s",
+                flush=True,
+            )
 
 
 def _atomic_write_domains(
@@ -733,11 +774,17 @@ def build(
                     f"{_quantity(unique_count, 'unique domain')}",
                     flush=True,
                 )
-                validator = dns_validator or _validate_dns_database
                 with _progress_heartbeat(
                     f"{dns_step_label} DNS validation"
                 ):
-                    validator(connection, dns_config)
+                    if dns_validator is None:
+                        _validate_dns_database(
+                            connection,
+                            dns_config,
+                            progress_label=dns_step_label,
+                        )
+                    else:
+                        dns_validator(connection, dns_config)
                     _remove_unresolved_domains(connection)
                 removed_count = connection.execute(
                     "SELECT COUNT(*) FROM removed"
