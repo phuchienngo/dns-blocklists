@@ -1,12 +1,9 @@
 # DNS blocklists
 
-Five independent, domain-only blocklists:
+Two independent, domain-only blocklists based on the sources used by Mullvad:
 
 - `output/adblock.txt`
 - `output/privacy.txt`
-- `output/adult.txt`
-- `output/gambling.txt`
-- `output/social.txt`
 
 There is no combined list. Every output is lowercase, sorted, deduplicated, and
 contains plain domains only. Input wildcards such as `*.example.com` become
@@ -52,6 +49,12 @@ blocked domains.
 
 The build fails instead of publishing partial output when a source is
 unavailable or dnsx itself cannot complete.
+
+The build logs each source as it is processed, the DNS validation totals, each
+output as it is written, and the total elapsed time. Source processing and DNS
+validation emit a heartbeat every 30 seconds so a slow or stuck phase remains
+visible in CI logs. Every phase also includes its overall step and percentage;
+the total consists of all sources, DNS validation, and all output files.
 
 ## DNS validation
 

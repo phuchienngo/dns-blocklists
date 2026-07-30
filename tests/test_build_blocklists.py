@@ -2,6 +2,9 @@ import unittest
 import tempfile
 import textwrap
 import sqlite3
+import time
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +16,9 @@ from scripts.build_blocklists import (
 
 
 class ParseContentTest(unittest.TestCase):
+    def test_progress_quantity_pluralizes_category(self) -> None:
+        self.assertEqual(builder._quantity(2, "category"), "2 categories")
+
     def test_stream_parser_accepts_one_shot_line_iterable(self) -> None:
         class OneShotLines:
             def __init__(self) -> None:
@@ -215,6 +221,117 @@ class DnsClassificationTest(unittest.TestCase):
             )
 
 class BuildTest(unittest.TestCase):
+    def test_reports_heartbeat_during_dns_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "custom.txt").write_text(
+                "ads.example.com\n",
+                encoding="utf-8",
+            )
+            config = {
+                "sources": [
+                    {
+                        "name": "local-ads",
+                        "category": "adblock",
+                        "format": "domains",
+                        "path": "custom.txt",
+                    }
+                ],
+            }
+            output = StringIO()
+
+            def slow_validator(
+                connection: sqlite3.Connection,
+                _dns_config: dict,
+            ) -> None:
+                time.sleep(0.04)
+                connection.execute(
+                    """
+                    CREATE TABLE dns_resolved (
+                        domain TEXT PRIMARY KEY
+                    ) WITHOUT ROWID
+                    """
+                )
+
+            with (
+                patch.object(
+                    builder,
+                    "PROGRESS_HEARTBEAT_SECONDS",
+                    0.01,
+                    create=True,
+                ),
+                redirect_stdout(output),
+            ):
+                build(
+                    config=config,
+                    base_directory=root,
+                    output_directory=root / "output",
+                    dns_validator=slow_validator,
+                )
+
+            self.assertIn(
+                "[step 2/3 | 67%] DNS validation still running (",
+                output.getvalue(),
+            )
+
+    def test_reports_build_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "custom.txt").write_text(
+                "ads.example.com\n",
+                encoding="utf-8",
+            )
+            config = {
+                "sources": [
+                    {
+                        "name": "local-ads",
+                        "category": "adblock",
+                        "format": "domains",
+                        "path": "custom.txt",
+                    }
+                ],
+            }
+            output = StringIO()
+
+            with redirect_stdout(output):
+                build(
+                    config=config,
+                    base_directory=root,
+                    output_directory=root / "output",
+                    skip_dns=True,
+                )
+
+            log = output.getvalue()
+            self.assertIn(
+                "Starting build: 3 total steps "
+                "(1 source, DNS validation, 1 category output)",
+                log,
+            )
+            self.assertIn(
+                "[step 1/3 | 33%] [source 1/1] "
+                "Processing local-ads (adblock, domains)",
+                log,
+            )
+            self.assertIn(
+                "[step 1/3 | 33%] [source 1/1] "
+                "Parsed local-ads: 1 domain",
+                log,
+            )
+            self.assertIn(
+                "[step 2/3 | 67%] DNS validation skipped: "
+                "retaining 1 unique domain",
+                log,
+            )
+            self.assertIn(
+                "[step 3/3 | 100%] [output 1/1] "
+                "Writing adblock.txt: 1 domain",
+                log,
+            )
+            self.assertIn(
+                "[step 3/3 | 100%] Build complete in ",
+                log,
+            )
+
     def test_builds_separate_outputs_without_filtering_domains(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

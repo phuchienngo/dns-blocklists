@@ -10,9 +10,11 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from io import StringIO, TextIOWrapper
 from pathlib import Path
 from typing import Any, TextIO
@@ -31,7 +33,42 @@ DOMAIN_PATTERN = re.compile(
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
 )
 VALID_SCOPES = {"auto", "host", "suffix"}
+PROGRESS_HEARTBEAT_SECONDS = 30
 DomainEmitter = Callable[[str, str], None]
+
+
+def _quantity(count: int, noun: str) -> str:
+    if count == 1:
+        return f"{count:,} {noun}"
+    plural = f"{noun[:-1]}ies" if noun.endswith("y") else f"{noun}s"
+    return f"{count:,} {plural}"
+
+
+def _step_label(step: int, total_steps: int) -> str:
+    percentage = step / total_steps * 100
+    return f"[step {step}/{total_steps} | {percentage:.0f}%]"
+
+
+@contextmanager
+def _progress_heartbeat(label: str):
+    started_at = time.monotonic()
+    stopped = threading.Event()
+
+    def report() -> None:
+        while not stopped.wait(PROGRESS_HEARTBEAT_SECONDS):
+            elapsed = time.monotonic() - started_at
+            print(
+                f"{label} still running ({elapsed:.0f}s elapsed)",
+                flush=True,
+            )
+
+    reporter = threading.Thread(target=report, daemon=True)
+    reporter.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        reporter.join()
 
 
 def normalize_domain(value: str) -> str | None:
@@ -603,6 +640,7 @@ def build(
         [sqlite3.Connection, dict[str, Any]], None
     ] | None = None,
 ) -> dict[str, int]:
+    started_at = time.monotonic()
     sources = config.get("sources")
     dns_config = config.get("dns", {})
     if not isinstance(sources, list) or not sources:
@@ -615,14 +653,32 @@ def build(
         if category not in categories:
             categories.append(category)
 
+    total_steps = len(sources) + 1 + len(categories)
+    dns_step = len(sources) + 1
+    print(
+        f"Starting build: {_quantity(total_steps, 'total step')} "
+        f"({_quantity(len(sources), 'source')}, "
+        "DNS validation, "
+        f"{_quantity(len(categories), 'category output')})",
+        flush=True,
+    )
+
     with tempfile.TemporaryDirectory(prefix="dns-blocklists-db-") as directory:
         database_path = Path(directory) / "build.sqlite3"
         with sqlite3.connect(database_path) as connection:
             _initialize_database(connection)
 
-            for source in sources:
+            for source_index, source in enumerate(sources, start=1):
                 name = source.get("name", "<unnamed>")
                 category = source.get("category")
+                source_format = source.get("format", "<unknown>")
+                step_label = _step_label(source_index, total_steps)
+                print(
+                    f"{step_label} [source {source_index}/{len(sources)}] "
+                    "Processing "
+                    f"{name} ({category}, {source_format})",
+                    flush=True,
+                )
 
                 source_count = 0
 
@@ -636,33 +692,68 @@ def build(
                     )
 
                 try:
-                    if "url" in source:
-                        if fetch_text is None:
-                            _consume_remote(source["url"], consume)
+                    with _progress_heartbeat(
+                        f"{step_label} Source {name}"
+                    ):
+                        if "url" in source:
+                            if fetch_text is None:
+                                _consume_remote(source["url"], consume)
+                            else:
+                                consume(StringIO(fetch_text(source["url"])))
+                        elif "path" in source:
+                            with (base_directory / source["path"]).open(
+                                encoding="utf-8-sig"
+                            ) as lines:
+                                consume(lines)
                         else:
-                            consume(StringIO(fetch_text(source["url"])))
-                    elif "path" in source:
-                        with (base_directory / source["path"]).open(
-                            encoding="utf-8-sig"
-                        ) as lines:
-                            consume(lines)
-                    else:
-                        raise ValueError("source requires url or path")
-                    _merge_source(connection, category)
-                    connection.commit()
+                            raise ValueError("source requires url or path")
+                        _merge_source(connection, category)
+                        connection.commit()
                 except Exception as error:
                     raise RuntimeError(
                         f"Failed to process source {name}: {error}"
                     ) from error
-                print(f"{name}: {source_count} domains")
+                print(
+                    f"{step_label} [source {source_index}/{len(sources)}] "
+                    "Parsed "
+                    f"{name}: {_quantity(source_count, 'domain')}",
+                    flush=True,
+                )
 
             connection.execute(
                 "CREATE TABLE removed(domain TEXT PRIMARY KEY) WITHOUT ROWID"
             )
+            unique_count = connection.execute(
+                "SELECT COUNT(*) FROM (SELECT domain FROM domains GROUP BY domain)"
+            ).fetchone()[0]
+            dns_step_label = _step_label(dns_step, total_steps)
             if not skip_dns:
+                print(
+                    f"{dns_step_label} DNS validation started: resolving "
+                    f"{_quantity(unique_count, 'unique domain')}",
+                    flush=True,
+                )
                 validator = dns_validator or _validate_dns_database
-                validator(connection, dns_config)
-                _remove_unresolved_domains(connection)
+                with _progress_heartbeat(
+                    f"{dns_step_label} DNS validation"
+                ):
+                    validator(connection, dns_config)
+                    _remove_unresolved_domains(connection)
+                removed_count = connection.execute(
+                    "SELECT COUNT(*) FROM removed"
+                ).fetchone()[0]
+                print(
+                    f"{dns_step_label} DNS validation complete: "
+                    f"{_quantity(unique_count - removed_count, 'domain')} kept, "
+                    f"{_quantity(removed_count, 'domain')} removed",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"{dns_step_label} DNS validation skipped: retaining "
+                    f"{_quantity(unique_count, 'unique domain')}",
+                    flush=True,
+                )
 
             output_counts: dict[str, int] = {}
             for category in categories:
@@ -684,7 +775,15 @@ def build(
                 f"{category}.txt" for category in categories
             }
             output_directory.mkdir(parents=True, exist_ok=True)
-            for category in categories:
+            for category_index, category in enumerate(categories, start=1):
+                output_step = dns_step + category_index
+                print(
+                    f"{_step_label(output_step, total_steps)} "
+                    f"[output {category_index}/{len(categories)}] Writing "
+                    f"{category}.txt: "
+                    f"{_quantity(output_counts[category], 'domain')}",
+                    flush=True,
+                )
                 rows = connection.execute(
                     """
                     SELECT d.domain
@@ -705,6 +804,11 @@ def build(
             for old_output in output_directory.glob("*.txt"):
                 if old_output.name not in expected_outputs:
                     old_output.unlink()
+    print(
+        f"{_step_label(total_steps, total_steps)} "
+        f"Build complete in {time.monotonic() - started_at:.1f}s",
+        flush=True,
+    )
     return output_counts
 
 
