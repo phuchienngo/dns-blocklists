@@ -1,0 +1,91 @@
+dns:
+  resolvers:
+    - 1.1.1.1
+    - 8.8.8.8
+
+sources:
+  - name: oisd-small
+    category: adblock
+    format: rpz
+    url: https://small.oisd.nl/rpz
+  - name: frellwits-swedish-hosts
+    category: adblock
+    format: hosts
+    url: https://raw.githubusercontent.com/lassekongo83/Frellwits-filter-lists/master/Frellwits-Swedish-Hosts-File.txt
+  - name: firebog-adguard-dns
+    category: adblock
+    format: domains
+    url: https://v.firebog.net/hosts/AdguardDNS.txt
+  - name: hagezi-popup-ads
+    category: adblock
+    format: domains
+    url: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/popupads-onlydomains.txt
+  - name: custom-adblock
+    category: adblock
+    format: domains
+    path: custom/adblock.txt
+
+  - name: firebog-easyprivacy
+    category: privacy
+    format: domains
+    url: https://v.firebog.net/hosts/Easyprivacy.txt
+  - name: hagezi-amazon
+    category: privacy
+    format: domains
+    url: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/domains/native.amazon.txt
+  - name: hagezi-apple
+    category: privacy
+    format: domains
+    url: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/domains/native.apple.txt
+  - name: hagezi-huawei
+    category: privacy
+    format: domains
+    url: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/domains/native.huawei.txt
+  - name: hagezi-windows-office
+    category: privacy
+    format: domains
+    url: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/domains/native.winoffice.txt
+  - name: hagezi-tiktok-aggressive
+    category: privacy
+    format: domains
+    url: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/domains/native.tiktok.extended.txt
+  - name: hagezi-lg-webos
+    category: privacy
+    format: domains
+    url: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/domains/native.lgwebos.txt
+  - name: hagezi-vivo
+    category: privacy
+    format: domains
+    url: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/domains/native.vivo.txt
+  - name: hagezi-oppo-realme
+    category: privacy
+    format: domains
+    url: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/domains/native.oppo-realme.txt
+  - name: hagezi-xiaomi
+    category: privacy
+    format: domains
+    url: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/domains/native.xiaomi.txt
+  - name: custom-privacy
+    category: privacy
+    format: domains
+    path: custom/privacy.txt
+
+  - name: oisd-nsfw
+    category: adult
+    format: rpz
+    url: https://nsfw.oisd.nl/rpz
+
+  - name: hagezi-gambling-onlydomains
+    category: gambling
+    format: domains
+    url: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/gambling-onlydomains.txt
+  - name: hagezi-gambling
+    category: gambling
+    format: domains
+    url: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/gambling.txt
+
+  - name: custom-social
+    category: social
+    format: domains
+    scope: suffix
+    path: custom/social.txt

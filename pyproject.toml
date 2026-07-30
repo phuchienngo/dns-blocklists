@@ -1,0 +1,14 @@
+[project]
+name = "dns-blocklists"
+version = "0.1.0"
+description = "Build categorized, domain-only DNS blocklists"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "dnspython==2.8.0",
+    "python-abp==0.2.0",
+    "pyyaml==6.0.3",
+]
+
+[tool.uv]
+package = false
+required-version = "==0.11.14"

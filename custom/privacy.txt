@@ -1,0 +1,5 @@
+adservice.google.com
+analytics.google.com
+appmetrica.yandex.ru
+browser.sentry-cdn.com
+sessions.bugsnag.com
