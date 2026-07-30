@@ -181,9 +181,9 @@ class DnsClassificationTest(unittest.TestCase):
                                     {
                                         "type": query_type,
                                         "data": (
-                                            "192.0.2.1"
+                                            "93.184.216.34"
                                             if query_type == "A"
-                                            else "2001:db8::1"
+                                            else "2606:4700:4700::1111"
                                         ),
                                     }
                                 ]
@@ -216,8 +216,12 @@ class DnsClassificationTest(unittest.TestCase):
                 [
                     ("A", ["a.example", "b.example"]),
                     ("AAAA", ["a.example", "b.example"]),
+                    ("A", ["b.example"]),
+                    ("AAAA", ["b.example"]),
                     ("A", ["c.example", "d.example"]),
                     ("AAAA", ["c.example", "d.example"]),
+                    ("A", ["e.example"]),
+                    ("AAAA", ["e.example"]),
                     ("A", ["e.example"]),
                     ("AAAA", ["e.example"]),
                 ],
@@ -262,9 +266,9 @@ class DnsClassificationTest(unittest.TestCase):
                 output_path = Path(command[command.index("-w") + 1])
                 query_type = command[command.index("-t") + 1]
                 address = (
-                    "192.0.2.1"
+                    "93.184.216.34"
                     if query_type == "A"
-                    else "2001:db8::1"
+                    else "2606:4700:4700::1111"
                 )
                 output_path.write_text(
                     json.dumps(
@@ -340,6 +344,8 @@ class DnsClassificationTest(unittest.TestCase):
                     ("wild.example", 1),
                     ("live.example", 0),
                     ("v6.example", 0),
+                    ("private.example", 0),
+                    ("multicast.example", 0),
                     ("missing.example", 0),
                 ],
             )
@@ -352,10 +358,16 @@ class DnsClassificationTest(unittest.TestCase):
                     '"status":"NOERROR","data":{"answers":[]}}\n',
                     '{"name":"live.example.","type":"A",'
                     '"status":"NOERROR","data":{"answers":['
-                    '{"type":"A","data":"192.0.2.1"}]}}\n',
+                    '{"type":"A","data":"93.184.216.34"}]}}\n',
                     '{"name":"v6.example.","type":"AAAA",'
                     '"status":"NOERROR","data":{"answers":['
-                    '{"type":"AAAA","data":"2001:db8::1"}]}}\n',
+                    '{"type":"AAAA","data":"2606:4700:4700::1111"}]}}\n',
+                    '{"name":"private.example.","type":"A",'
+                    '"status":"NOERROR","data":{"answers":['
+                    '{"type":"A","data":"127.0.0.1"}]}}\n',
+                    '{"name":"multicast.example.","type":"A",'
+                    '"status":"NOERROR","data":{"answers":['
+                    '{"type":"A","data":"224.0.0.1"}]}}\n',
                 ],
             )
             connection.execute(
@@ -370,11 +382,144 @@ class DnsClassificationTest(unittest.TestCase):
                 [
                     ("dead.example",),
                     ("missing.example",),
+                    ("multicast.example",),
+                    ("private.example",),
                     ("wild.example",),
                 ],
             )
 
+    def test_massdns_retries_unresolved_and_keeps_unknown(self) -> None:
+        with sqlite3.connect(":memory:") as connection:
+            builder._initialize_database(connection)
+            connection.executemany(
+                """
+                INSERT INTO domains(category, domain, scope)
+                VALUES ('adblock', ?, 0)
+                """,
+                [
+                    ("dead.example",),
+                    ("recovered.example",),
+                    ("resolved.example",),
+                    ("unknown.example",),
+                ],
+            )
+            calls: list[tuple[str, str, list[str]]] = []
+
+            def complete_massdns(command, **_kwargs) -> None:
+                query_type = command[command.index("-t") + 1]
+                resolver_text = Path(
+                    command[command.index("-r") + 1]
+                ).read_text(encoding="utf-8")
+                domains = Path(command[-1]).read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                calls.append((resolver_text, query_type, domains))
+                output_path = Path(command[command.index("-w") + 1])
+                retry = command[command.index("-s") + 1] == "100"
+                rows = []
+                for domain in domains:
+                    status = "SERVFAIL"
+                    answers = []
+                    if not retry and domain == "resolved.example":
+                        status = "NOERROR"
+                        answers = [
+                            {
+                                "type": query_type,
+                                "data": (
+                                    "93.184.216.34"
+                                    if query_type == "A"
+                                    else "2606:4700:4700::1111"
+                                ),
+                            }
+                        ]
+                    elif retry and domain == "recovered.example":
+                        status = "NOERROR"
+                        answers = [
+                            {
+                                "type": query_type,
+                                "data": (
+                                    "93.184.216.34"
+                                    if query_type == "A"
+                                    else "2606:4700:4700::1111"
+                                ),
+                            }
+                        ]
+                    elif domain == "dead.example":
+                        status = "NXDOMAIN"
+                    payload = {
+                        "name": f"{domain}.",
+                        "type": query_type,
+                        "status": status,
+                    }
+                    if answers:
+                        payload["data"] = {"answers": answers}
+                    rows.append(json.dumps(payload))
+                output_path.write_text(
+                    "\n".join(rows) + "\n",
+                    encoding="utf-8",
+                )
+
+            with (
+                patch.object(
+                    builder.shutil,
+                    "which",
+                    return_value="/massdns",
+                ),
+                patch.object(
+                    builder.subprocess,
+                    "run",
+                    side_effect=complete_massdns,
+                ),
+            ):
+                builder._validate_dns_database(
+                    connection,
+                    {"resolvers": ["1.1.1.1", "8.8.8.8"]},
+                )
+                connection.execute(
+                    "CREATE TABLE removed(domain TEXT PRIMARY KEY) WITHOUT ROWID"
+                )
+                builder._remove_unresolved_domains(connection)
+
+            self.assertEqual(
+                list(connection.execute("SELECT domain FROM removed")),
+                [("dead.example",)],
+            )
+            self.assertEqual(len(calls), 6)
+            self.assertEqual(
+                [call[0] for call in calls],
+                [
+                    "1.1.1.1\n8.8.8.8\n",
+                    "1.1.1.1\n8.8.8.8\n",
+                    "1.1.1.1\n",
+                    "1.1.1.1\n",
+                    "8.8.8.8\n",
+                    "8.8.8.8\n",
+                ],
+            )
+            self.assertEqual(
+                calls[2][2],
+                [
+                    "dead.example",
+                    "recovered.example",
+                    "unknown.example",
+                ],
+            )
+
 class BuildTest(unittest.TestCase):
+    def test_output_has_no_trailing_newline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "domains.txt"
+
+            builder._atomic_write_domains(
+                output_path,
+                iter([("a.example",), ("b.example",)]),
+            )
+
+            self.assertEqual(
+                output_path.read_bytes(),
+                b"a.example\nb.example",
+            )
+
     def test_reports_heartbeat_during_dns_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -529,11 +674,11 @@ class BuildTest(unittest.TestCase):
             self.assertEqual(counts, {"adblock": 2, "social": 2})
             self.assertEqual(
                 (root / "output/adblock.txt").read_text(encoding="utf-8"),
-                "ads.example.com\nallowed.example.com\n",
+                "ads.example.com\nallowed.example.com",
             )
             self.assertEqual(
                 (root / "output/social.txt").read_text(encoding="utf-8"),
-                "local.example.com\nshared.example.com\n",
+                "local.example.com\nshared.example.com",
             )
     def test_dns_failure_keeps_existing_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

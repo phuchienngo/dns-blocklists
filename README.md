@@ -56,18 +56,23 @@ visible in CI logs. Every phase also includes its overall step and percentage;
 the total consists of all sources, DNS validation, and all output files.
 
 DNS validation runs in batches of 10,000 domains. After every batch, the log
-reports cumulative processed, kept, and removed counts. This provides exact
-progress without loading the full domain list into RAM.
+reports cumulative processed, kept, removed, and unknown counts. This provides
+exact progress without loading the full domain list into RAM.
 
 ## DNS validation
 
-MassDNS runs separate A and AAAA passes against every resolver configured in
-`sources.yaml`. Domains are processed in batches of 10,000 with a hash-map size
-of 500 concurrent lookups and up to three resolve attempts.
+MassDNS first runs separate A and AAAA passes against the unfiltered resolvers
+configured in `sources.yaml`, using a hash-map size of 500. Domains without a
+global address are retried against each resolver independently with a lower
+hash-map size of 100.
 
-- A domain with any A or AAAA answer is kept.
-- A domain without an A or AAAA address is removed immediately, including
-  NXDOMAIN, NODATA, timeout, SERVFAIL, REFUSED, and missing output.
+- A domain with any globally routable A or AAAA answer is kept.
+- A domain is removed only when every resolver independently returns NXDOMAIN
+  or NODATA for both A and AAAA.
+- A domain with timeout, SERVFAIL, REFUSED, or missing output after retry is
+  classified as unknown and kept to avoid false removal.
+- Sinkhole and non-routable addresses such as unspecified, loopback, private,
+  link-local, and reserved IPs do not count as resolved.
 
 No DNS state is stored. GitHub Actions builds a pinned MassDNS commit from
 source without a cache, runs full validation weekly, and commits updated output.

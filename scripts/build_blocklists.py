@@ -35,6 +35,7 @@ DOMAIN_PATTERN = re.compile(
 VALID_SCOPES = {"auto", "host", "suffix"}
 PROGRESS_HEARTBEAT_SECONDS = 30
 DNS_BATCH_SIZE = 10_000
+DNS_RETRY_HASHMAP_SIZE = 100
 DomainEmitter = Callable[[str, str], None]
 
 
@@ -366,6 +367,9 @@ def parse_content(
 def _store_massdns_results(
     connection: sqlite3.Connection,
     lines: Iterable[str],
+    *,
+    resolver: str | None = None,
+    query_type: str | None = None,
 ) -> int:
     connection.execute(
         """
@@ -374,8 +378,9 @@ def _store_massdns_results(
         ) WITHOUT ROWID
         """
     )
-    changes_before = connection.total_changes
+    resolved_changes = 0
     rows: list[tuple[str]] = []
+    observations: list[tuple[str, str, str, str]] = []
     for line_number, raw_line in enumerate(lines, start=1):
         if not raw_line.strip():
             continue
@@ -389,8 +394,12 @@ def _store_massdns_results(
         if not domain:
             continue
         data = payload.get("data") or {}
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Invalid MassDNS answer on line {line_number}"
+            )
         answers = data.get("answers") or []
-        if not isinstance(data, dict) or not isinstance(answers, list):
+        if not isinstance(answers, list):
             raise ValueError(
                 f"Invalid MassDNS answer on line {line_number}"
             )
@@ -412,24 +421,58 @@ def _store_massdns_results(
             if (
                 (record_type == "A" and address.version == 4)
                 or (record_type == "AAAA" and address.version == 6)
-            ):
+            ) and address.is_global and not address.is_multicast:
                 has_address = True
                 break
-        if not has_address:
-            continue
-        rows.append((domain,))
+        if has_address:
+            rows.append((domain,))
+        if resolver is not None and query_type is not None:
+            status = payload.get("status")
+            outcome = (
+                "resolved"
+                if has_address
+                else (
+                    "negative"
+                    if status in {"NOERROR", "NXDOMAIN"}
+                    else "unknown"
+                )
+            )
+            observations.append(
+                (domain, resolver, query_type, outcome)
+            )
         if len(rows) >= 5000:
+            changes_before = connection.total_changes
             connection.executemany(
                 "INSERT OR IGNORE INTO dns_resolved VALUES (?)",
                 rows,
             )
+            resolved_changes += connection.total_changes - changes_before
             rows.clear()
+        if len(observations) >= 5000:
+            connection.executemany(
+                """
+                INSERT OR REPLACE INTO dns_retry_observations
+                VALUES (?, ?, ?, ?)
+                """,
+                observations,
+            )
+            observations.clear()
     if rows:
+        changes_before = connection.total_changes
         connection.executemany(
             "INSERT OR IGNORE INTO dns_resolved VALUES (?)",
             rows,
         )
-    return connection.total_changes - changes_before
+        resolved_changes += connection.total_changes - changes_before
+    if observations:
+        connection.executemany(
+            """
+            INSERT OR REPLACE INTO dns_retry_observations
+            VALUES (?, ?, ?, ?)
+            """,
+            observations,
+        )
+    return resolved_changes
 
 
 def _remove_unresolved_domains(
@@ -449,6 +492,11 @@ def _remove_unresolved_domains(
             FROM dns_resolved AS resolved
             WHERE resolved.domain = global_domains.domain
         )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM dns_unknown AS unknown
+              WHERE unknown.domain = global_domains.domain
+          )
         """
     )
 
@@ -516,6 +564,9 @@ def _initialize_database(connection: sqlite3.Connection) -> None:
             scope INTEGER NOT NULL,
             PRIMARY KEY (category, domain)
         ) WITHOUT ROWID;
+        CREATE TABLE dns_unknown (
+            domain TEXT PRIMARY KEY
+        ) WITHOUT ROWID;
         """
     )
 
@@ -580,15 +631,25 @@ def _validate_dns_database(
         ) WITHOUT ROWID
         """
     )
+    connection.executescript(
+        """
+        CREATE TEMP TABLE dns_batch (
+            domain TEXT PRIMARY KEY
+        ) WITHOUT ROWID;
+        CREATE TEMP TABLE dns_retry_observations (
+            domain TEXT NOT NULL,
+            resolver TEXT NOT NULL,
+            query_type TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            PRIMARY KEY (domain, resolver, query_type)
+        ) WITHOUT ROWID;
+        """
+    )
 
     with tempfile.TemporaryDirectory(prefix="dns-blocklists-") as directory:
         temporary = Path(directory)
         input_path = temporary / "domains.txt"
         resolver_path = temporary / "resolvers.txt"
-        resolver_path.write_text(
-            "".join(f"{resolver}\n" for resolver in resolvers),
-            encoding="utf-8",
-        )
         output_path = temporary / "massdns.jsonl"
         error_path = temporary / "massdns.err"
         domain_cursor = connection.execute(
@@ -600,65 +661,174 @@ def _validate_dns_database(
             """
         )
         processed_count = 0
-        kept_count = 0
+        resolved_count = 0
+        unknown_count = 0
+        removed_count = 0
         started_at = time.monotonic()
         batch_index = 0
         while batch := domain_cursor.fetchmany(DNS_BATCH_SIZE):
             batch_index += 1
+            connection.execute("DELETE FROM dns_batch")
+            connection.executemany(
+                "INSERT INTO dns_batch VALUES (?)",
+                batch,
+            )
             with input_path.open("w", encoding="utf-8") as input_file:
                 for (domain,) in batch:
                     input_file.write(f"{domain}\n")
 
-            for query_type in ("A", "AAAA"):
-                command = [
-                    resolved_executable,
-                    "-r",
-                    str(resolver_path),
-                    "-t",
-                    query_type,
-                    "-o",
-                    "Je",
-                    "-q",
-                    "-c",
-                    str(resolve_count),
-                    "-s",
-                    str(hashmap_size),
-                    "--verify-ip",
-                    "-w",
-                    str(output_path),
-                    str(input_path),
-                ]
-                with error_path.open("w", encoding="utf-8") as errors:
-                    try:
-                        subprocess.run(
-                            command,
-                            stderr=errors,
-                            check=True,
-                            timeout=command_timeout,
-                        )
-                    except (
-                        subprocess.CalledProcessError,
-                        subprocess.TimeoutExpired,
-                    ) as error:
-                        raise RuntimeError(
-                            f"massdns {query_type} failed on batch "
-                            f"{batch_index}/{total_batches}"
-                        ) from error
+            def run_massdns(
+                *,
+                input_file: Path,
+                active_resolvers: list[str],
+                active_hashmap_size: int,
+                observed_resolver: str | None = None,
+            ) -> None:
+                resolver_path.write_text(
+                    "".join(
+                        f"{resolver}\n" for resolver in active_resolvers
+                    ),
+                    encoding="utf-8",
+                )
+                for active_query_type in ("A", "AAAA"):
+                    command = [
+                        resolved_executable,
+                        "-r",
+                        str(resolver_path),
+                        "-t",
+                        active_query_type,
+                        "-o",
+                        "Je",
+                        "-q",
+                        "-c",
+                        str(resolve_count),
+                        "-s",
+                        str(active_hashmap_size),
+                        "--verify-ip",
+                        "-w",
+                        str(output_path),
+                        str(input_file),
+                    ]
+                    with error_path.open("w", encoding="utf-8") as errors:
+                        try:
+                            subprocess.run(
+                                command,
+                                stderr=errors,
+                                check=True,
+                                timeout=command_timeout,
+                            )
+                        except (
+                            subprocess.CalledProcessError,
+                            subprocess.TimeoutExpired,
+                        ) as error:
+                            raise RuntimeError(
+                                f"massdns {active_query_type} failed on "
+                                f"batch {batch_index}/{total_batches}"
+                            ) from error
 
-                with output_path.open(encoding="utf-8") as output:
-                    kept_count += _store_massdns_results(
-                        connection,
-                        output,
+                    with output_path.open(encoding="utf-8") as output:
+                        _store_massdns_results(
+                            connection,
+                            output,
+                            resolver=observed_resolver,
+                            query_type=active_query_type,
+                        )
+
+            run_massdns(
+                input_file=input_path,
+                active_resolvers=resolvers,
+                active_hashmap_size=hashmap_size,
+            )
+
+            retry_domains = list(
+                connection.execute(
+                    """
+                    SELECT batch.domain
+                    FROM dns_batch AS batch
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM dns_resolved AS resolved
+                        WHERE resolved.domain = batch.domain
                     )
+                    ORDER BY batch.domain
+                    """
+                )
+            )
+            connection.execute("DELETE FROM dns_retry_observations")
+            if retry_domains:
+                with input_path.open("w", encoding="utf-8") as input_file:
+                    for (domain,) in retry_domains:
+                        input_file.write(f"{domain}\n")
+                for resolver in resolvers:
+                    run_massdns(
+                        input_file=input_path,
+                        active_resolvers=[resolver],
+                        active_hashmap_size=DNS_RETRY_HASHMAP_SIZE,
+                        observed_resolver=resolver,
+                    )
+
+            required_negatives = len(resolvers) * 2
+            batch_resolved = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM dns_batch AS batch
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM dns_resolved AS resolved
+                    WHERE resolved.domain = batch.domain
+                )
+                """
+            ).fetchone()[0]
+            batch_removed = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM dns_batch AS batch
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM dns_resolved AS resolved
+                    WHERE resolved.domain = batch.domain
+                )
+                  AND (
+                      SELECT COUNT(*)
+                      FROM dns_retry_observations AS observation
+                      WHERE observation.domain = batch.domain
+                        AND observation.outcome = 'negative'
+                  ) = ?
+                """,
+                (required_negatives,),
+            ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO dns_unknown(domain)
+                SELECT batch.domain
+                FROM dns_batch AS batch
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM dns_resolved AS resolved
+                    WHERE resolved.domain = batch.domain
+                )
+                  AND (
+                      SELECT COUNT(*)
+                      FROM dns_retry_observations AS observation
+                      WHERE observation.domain = batch.domain
+                        AND observation.outcome = 'negative'
+                  ) < ?
+                """,
+                (required_negatives,),
+            )
+            batch_unknown = len(batch) - batch_resolved - batch_removed
             processed_count += len(batch)
-            removed_count = processed_count - kept_count
+            resolved_count += batch_resolved
+            unknown_count += batch_unknown
+            removed_count += batch_removed
+            kept_count = resolved_count + unknown_count
             percentage = processed_count / total_domains * 100
             prefix = f"{progress_label} " if progress_label else ""
             print(
                 f"{prefix}DNS batch {batch_index}/{total_batches} complete: "
                 f"processed {processed_count:,}/{total_domains:,} "
                 f"({percentage:.1f}%), kept {kept_count:,}, "
-                f"removed {removed_count:,}, "
+                f"removed {removed_count:,}, unknown {unknown_count:,}, "
                 f"elapsed {time.monotonic() - started_at:.0f}s",
                 flush=True,
             )
@@ -676,8 +846,10 @@ def _atomic_write_domains(
         prefix=f".{path.name}.",
         delete=False,
     ) as temporary:
+        separator = ""
         for (domain,) in rows:
-            temporary.write(f"{domain}\n")
+            temporary.write(f"{separator}{domain}")
+            separator = "\n"
         temporary_path = Path(temporary.name)
     try:
         temporary_path.replace(path)

@@ -1,5 +1,6 @@
-adservice.google.com
-analytics.google.com
-appmetrica.yandex.ru
-browser.sentry-cdn.com
-sessions.bugsnag.com
+socialapi.momo.vn
+socialapi.mservice.com.vn
+socialhub.momo.vn
+socialhub.mservice.com.vn
+social-dev.momocdn.net
+social.momocdn.net
