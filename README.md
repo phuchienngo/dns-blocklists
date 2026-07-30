@@ -11,10 +11,9 @@ contains plain domains only. Input wildcards such as `*.example.com` become
 
 ## Build
 
-Install `uv` and provide `dnsx` 1.3.0. `uv` provisions Python 3.12 and all
-locked Python dependencies automatically. Use the pinned binary from the
-[dnsx v1.3.0 release](https://github.com/projectdiscovery/dnsx/releases/tag/v1.3.0)
-or place a compatible `dnsx` executable on `PATH`.
+Install `uv` and provide a compatible
+[MassDNS](https://github.com/blechschmidt/massdns) executable on `PATH`. `uv`
+provisions Python 3.12 and all locked Python dependencies automatically.
 
 ```bash
 uv run --locked python -m unittest discover -s tests -v
@@ -39,7 +38,7 @@ deduplication indexes, and resolved-domain markers are kept in a temporary
 SQLite database on disk; sorted TXT outputs are written row by row. RAM usage
 therefore does not grow with the total number of input domains, but the system
 temporary directory must have enough free disk space for the build database and
-dnsx JSONL output.
+MassDNS JSONL output.
 
 Adblock syntax is parsed with `python-abp`; only blocking URL patterns that can
 be converted safely to a domain are kept. Exception, cosmetic, regular
@@ -48,7 +47,7 @@ parsed with `dnspython`; only owners redirected by `CNAME .` are treated as
 blocked domains.
 
 The build fails instead of publishing partial output when a source is
-unavailable or dnsx itself cannot complete.
+unavailable or MassDNS itself cannot complete.
 
 The build logs each source as it is processed, the DNS validation totals, each
 output as it is written, and the total elapsed time. Source processing and DNS
@@ -62,14 +61,13 @@ progress without loading the full domain list into RAM.
 
 ## DNS validation
 
-dnsx queries A and AAAA in stream mode using every resolver configured in
-`sources.yaml`. It retries each unresolved domain up to three times and can use
-UDP, TCP, DoH, or DoT resolver entries.
+MassDNS runs separate A and AAAA passes against every resolver configured in
+`sources.yaml`. Domains are processed in batches of 10,000 with a hash-map size
+of 500 concurrent lookups and up to three resolve attempts.
 
 - A domain with any A or AAAA answer is kept.
 - A domain without an A or AAAA address is removed immediately, including
   NXDOMAIN, NODATA, timeout, SERVFAIL, REFUSED, and missing output.
 
-No DNS state is stored. GitHub Actions downloads dnsx 1.3.0 on every run,
-verifies the pinned archive checksum, runs full validation weekly, and commits
-updated output.
+No DNS state is stored. GitHub Actions builds a pinned MassDNS commit from
+source without a cache, runs full validation weekly, and commits updated output.

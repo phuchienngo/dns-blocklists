@@ -363,7 +363,7 @@ def parse_content(
     return domains
 
 
-def _store_dnsx_results(
+def _store_massdns_results(
     connection: sqlite3.Connection,
     lines: Iterable[str],
 ) -> int:
@@ -381,22 +381,40 @@ def _store_dnsx_results(
             continue
         try:
             payload = json.loads(raw_line)
-            domain = normalize_domain(payload["host"])
+            domain = normalize_domain(payload["name"])
         except (KeyError, TypeError, json.JSONDecodeError) as error:
             raise ValueError(
-                f"Invalid dnsx JSON on line {line_number}"
+                f"Invalid MassDNS JSON on line {line_number}"
             ) from error
         if not domain:
             continue
-        addresses = payload.get("a", []) + payload.get("aaaa", [])
-        try:
-            has_address = any(
-                ipaddress.ip_address(address) for address in addresses
-            )
-        except (TypeError, ValueError) as error:
+        data = payload.get("data") or {}
+        answers = data.get("answers") or []
+        if not isinstance(data, dict) or not isinstance(answers, list):
             raise ValueError(
-                f"Invalid dnsx address on line {line_number}"
-            ) from error
+                f"Invalid MassDNS answer on line {line_number}"
+            )
+        has_address = False
+        for answer in answers:
+            if not isinstance(answer, dict):
+                raise ValueError(
+                    f"Invalid MassDNS answer on line {line_number}"
+                )
+            record_type = answer.get("type")
+            if record_type not in {"A", "AAAA"}:
+                continue
+            try:
+                address = ipaddress.ip_address(answer["data"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Invalid MassDNS address on line {line_number}"
+                ) from error
+            if (
+                (record_type == "A" and address.version == 4)
+                or (record_type == "AAAA" and address.version == 6)
+            ):
+                has_address = True
+                break
         if not has_address:
             continue
         rows.append((domain,))
@@ -541,14 +559,13 @@ def _validate_dns_database(
     resolvers = dns_config.get("resolvers")
     if not isinstance(resolvers, list) or not resolvers:
         raise ValueError("dns.resolvers must contain at least one resolver")
-    threads = int(dns_config.get("threads", 100))
-    retries = int(dns_config.get("retries", 3))
-    query_timeout = int(dns_config.get("query_timeout_seconds", 3))
     command_timeout = int(dns_config.get("command_timeout_seconds", 3600))
-    executable = str(dns_config.get("executable", "dnsx"))
+    hashmap_size = int(dns_config.get("hashmap_size", 500))
+    resolve_count = int(dns_config.get("resolve_count", 3))
+    executable = str(dns_config.get("executable", "massdns"))
     resolved_executable = shutil.which(executable)
     if not resolved_executable:
-        raise RuntimeError(f"dnsx executable not found: {executable}")
+        raise RuntimeError(f"massdns executable not found: {executable}")
 
     total_domains = connection.execute(
         "SELECT COUNT(*) FROM (SELECT domain FROM domains GROUP BY domain)"
@@ -572,26 +589,8 @@ def _validate_dns_database(
             "".join(f"{resolver}\n" for resolver in resolvers),
             encoding="utf-8",
         )
-        output_path = temporary / "dnsx.jsonl"
-        error_path = temporary / "dnsx.err"
-        command = [
-            resolved_executable,
-            "-a",
-            "-aaaa",
-            "-r",
-            str(resolver_path),
-            "-retry",
-            str(retries),
-            "-timeout",
-            str(query_timeout),
-            "-threads",
-            str(threads),
-            "-stream",
-            "-json",
-            "-omit-raw",
-            "-silent",
-            "-disable-update-check",
-        ]
+        output_path = temporary / "massdns.jsonl"
+        error_path = temporary / "massdns.err"
         domain_cursor = connection.execute(
             """
             SELECT domain
@@ -610,31 +609,47 @@ def _validate_dns_database(
                 for (domain,) in batch:
                     input_file.write(f"{domain}\n")
 
-            with (
-                input_path.open(encoding="utf-8") as input_file,
-                output_path.open("w", encoding="utf-8") as output,
-                error_path.open("w", encoding="utf-8") as errors,
-            ):
-                try:
-                    subprocess.run(
-                        command,
-                        stdin=input_file,
-                        stdout=output,
-                        stderr=errors,
-                        check=True,
-                        timeout=command_timeout,
-                    )
-                except (
-                    subprocess.CalledProcessError,
-                    subprocess.TimeoutExpired,
-                ) as error:
-                    raise RuntimeError(
-                        f"dnsx failed on batch "
-                        f"{batch_index}/{total_batches}"
-                    ) from error
+            for query_type in ("A", "AAAA"):
+                command = [
+                    resolved_executable,
+                    "-r",
+                    str(resolver_path),
+                    "-t",
+                    query_type,
+                    "-o",
+                    "Je",
+                    "-q",
+                    "-c",
+                    str(resolve_count),
+                    "-s",
+                    str(hashmap_size),
+                    "--verify-ip",
+                    "-w",
+                    str(output_path),
+                    str(input_path),
+                ]
+                with error_path.open("w", encoding="utf-8") as errors:
+                    try:
+                        subprocess.run(
+                            command,
+                            stderr=errors,
+                            check=True,
+                            timeout=command_timeout,
+                        )
+                    except (
+                        subprocess.CalledProcessError,
+                        subprocess.TimeoutExpired,
+                    ) as error:
+                        raise RuntimeError(
+                            f"massdns {query_type} failed on batch "
+                            f"{batch_index}/{total_batches}"
+                        ) from error
 
-            with output_path.open(encoding="utf-8") as output:
-                kept_count += _store_dnsx_results(connection, output)
+                with output_path.open(encoding="utf-8") as output:
+                    kept_count += _store_massdns_results(
+                        connection,
+                        output,
+                    )
             processed_count += len(batch)
             removed_count = processed_count - kept_count
             percentage = processed_count / total_domains * 100

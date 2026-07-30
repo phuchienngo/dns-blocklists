@@ -17,8 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
-      DNSX_VERSION: 1.3.0
-      DNSX_LINUX_AMD64_SHA256: 1415020474886151a4820c62b9e68a315cc062f7f111a2fd13fda99047a809a6
+      MASSDNS_COMMIT: 6bfa47197d78e68b79041d494e280174cb2d6ae1
 
     steps:
       - name: Check out repository
@@ -34,22 +33,22 @@ jobs:
       - name: Sync Python dependencies
         run: uv sync --locked
 
-      - name: Install pinned dnsx binary
+      - name: Build and install pinned MassDNS
         run: |
-          dnsx_temp="$(mktemp -d)"
-          dnsx_archive="$dnsx_temp/dnsx.zip"
-          curl --fail --location --silent --show-error \
-            "https://github.com/projectdiscovery/dnsx/releases/download/v${DNSX_VERSION}/dnsx_${DNSX_VERSION}_linux_amd64.zip" \
-            --output "$dnsx_archive"
-          echo "${DNSX_LINUX_AMD64_SHA256}  ${dnsx_archive}" | sha256sum --check -
-          unzip -q "$dnsx_archive" dnsx -d "$dnsx_temp"
+          massdns_temp="$(mktemp -d)"
+          git -C "$massdns_temp" init --quiet
+          git -C "$massdns_temp" remote add origin https://github.com/blechschmidt/massdns.git
+          git -C "$massdns_temp" fetch --quiet --depth 1 origin "$MASSDNS_COMMIT"
+          git -C "$massdns_temp" checkout --quiet --detach FETCH_HEAD
+          test "$(git -C "$massdns_temp" rev-parse HEAD)" = "$MASSDNS_COMMIT"
+          make -C "$massdns_temp" -j2
           mkdir -p "$HOME/.local/bin"
-          install -m 0755 "$dnsx_temp/dnsx" "$HOME/.local/bin/dnsx"
+          install -m 0755 "$massdns_temp/bin/massdns" "$HOME/.local/bin/massdns"
 
-      - name: Add dnsx to PATH
+      - name: Add MassDNS to PATH
         run: |
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/dnsx" -version
+          "$HOME/.local/bin/massdns" --help >/dev/null 2>&1
 
       - name: Test
         run: uv run --locked python -m unittest discover -s tests -v

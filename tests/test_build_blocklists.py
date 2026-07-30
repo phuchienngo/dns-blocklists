@@ -123,7 +123,7 @@ class ParseContentTest(unittest.TestCase):
 
 
 class DnsClassificationTest(unittest.TestCase):
-    def test_dnsx_reports_cumulative_batch_progress(self) -> None:
+    def test_massdns_reports_cumulative_batch_progress(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "domains.txt").write_text(
@@ -150,35 +150,58 @@ class DnsClassificationTest(unittest.TestCase):
                     }
                 ],
             }
-            batches: list[list[str]] = []
+            calls: list[tuple[str, list[str]]] = []
 
-            def complete_dnsx(_command, **kwargs) -> None:
-                domains = [
-                    line.strip()
-                    for line in kwargs["stdin"]
-                    if line.strip()
-                ]
-                batches.append(domains)
-                for domain in domains:
-                    if domain not in {"b.example", "e.example"}:
-                        kwargs["stdout"].write(
-                            json.dumps(
-                                {
-                                    "host": domain,
-                                    "a": ["192.0.2.1"],
-                                }
-                            )
-                            + "\n"
+            def complete_massdns(command, **_kwargs) -> None:
+                query_type = command[command.index("-t") + 1]
+                domains = Path(command[-1]).read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                calls.append((query_type, domains))
+                output_path = Path(command[command.index("-w") + 1])
+                with output_path.open("w", encoding="utf-8") as output:
+                    for domain in domains:
+                        has_address = (
+                            query_type == "A"
+                            and domain in {"a.example", "c.example"}
+                        ) or (
+                            query_type == "AAAA"
+                            and domain == "d.example"
                         )
+                        payload = {
+                            "name": f"{domain}.",
+                            "type": query_type,
+                            "status": (
+                                "NOERROR" if has_address else "NXDOMAIN"
+                            ),
+                        }
+                        if has_address:
+                            payload["data"] = {
+                                "answers": [
+                                    {
+                                        "type": query_type,
+                                        "data": (
+                                            "192.0.2.1"
+                                            if query_type == "A"
+                                            else "2001:db8::1"
+                                        ),
+                                    }
+                                ]
+                            }
+                        output.write(json.dumps(payload) + "\n")
 
             output = StringIO()
             with (
                 patch.object(builder, "DNS_BATCH_SIZE", 2, create=True),
-                patch.object(builder.shutil, "which", return_value="/dnsx"),
+                patch.object(
+                    builder.shutil,
+                    "which",
+                    return_value="/massdns",
+                ),
                 patch.object(
                     builder.subprocess,
                     "run",
-                    side_effect=complete_dnsx,
+                    side_effect=complete_massdns,
                 ),
                 redirect_stdout(output),
             ):
@@ -189,11 +212,14 @@ class DnsClassificationTest(unittest.TestCase):
                 )
 
             self.assertEqual(
-                batches,
+                calls,
                 [
-                    ["a.example", "b.example"],
-                    ["c.example", "d.example"],
-                    ["e.example"],
+                    ("A", ["a.example", "b.example"]),
+                    ("AAAA", ["a.example", "b.example"]),
+                    ("A", ["c.example", "d.example"]),
+                    ("AAAA", ["c.example", "d.example"]),
+                    ("A", ["e.example"]),
+                    ("AAAA", ["e.example"]),
                 ],
             )
             self.assertEqual(counts, {"adblock": 3})
@@ -209,7 +235,7 @@ class DnsClassificationTest(unittest.TestCase):
                 log,
             )
 
-    def test_dnsx_streams_a_and_aaaa_through_one_resolver_file(self) -> None:
+    def test_massdns_runs_a_and_aaaa_with_one_resolver_file(self) -> None:
         with sqlite3.connect(":memory:") as connection:
             builder._initialize_database(connection)
             connection.execute(
@@ -220,27 +246,56 @@ class DnsClassificationTest(unittest.TestCase):
             )
             commands: list[list[str]] = []
             resolver_files: list[str] = []
-            input_domains: list[str] = []
+            input_batches: list[list[str]] = []
 
-            def complete_dnsx(command, **kwargs) -> None:
+            def complete_massdns(command, **_kwargs) -> None:
                 commands.append(command)
                 resolver_path = Path(command[command.index("-r") + 1])
                 resolver_files.append(
                     resolver_path.read_text(encoding="utf-8")
                 )
-                input_domains.extend(
-                    line.strip() for line in kwargs["stdin"] if line.strip()
+                input_batches.append(
+                    Path(command[-1]).read_text(
+                        encoding="utf-8"
+                    ).splitlines()
                 )
-                kwargs["stdout"].write(
-                    '{"host":"live.example","a":["192.0.2.1"]}\n'
+                output_path = Path(command[command.index("-w") + 1])
+                query_type = command[command.index("-t") + 1]
+                address = (
+                    "192.0.2.1"
+                    if query_type == "A"
+                    else "2001:db8::1"
+                )
+                output_path.write_text(
+                    json.dumps(
+                        {
+                            "name": "live.example.",
+                            "type": query_type,
+                            "status": "NOERROR",
+                            "data": {
+                                "answers": [
+                                    {
+                                        "type": query_type,
+                                        "data": address,
+                                    }
+                                ]
+                            },
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
                 )
 
             with (
-                patch.object(builder.shutil, "which", return_value="/dnsx"),
+                patch.object(
+                    builder.shutil,
+                    "which",
+                    return_value="/massdns",
+                ),
                 patch.object(
                     builder.subprocess,
                     "run",
-                    side_effect=complete_dnsx,
+                    side_effect=complete_massdns,
                 ),
             ):
                 builder._validate_dns_database(
@@ -248,25 +303,31 @@ class DnsClassificationTest(unittest.TestCase):
                     {"resolvers": ["1.1.1.1", "8.8.8.8"]},
                 )
 
-            self.assertEqual(len(commands), 1)
-            self.assertEqual(commands[0][0], "/dnsx")
+            self.assertEqual(len(commands), 2)
+            self.assertTrue(all(command[0] == "/massdns" for command in commands))
+            self.assertEqual(
+                [command[command.index("-t") + 1] for command in commands],
+                ["A", "AAAA"],
+            )
             self.assertTrue(
-                {
-                    "-a",
-                    "-aaaa",
-                    "-stream",
-                    "-json",
-                    "-omit-raw",
-                    "-disable-update-check",
-                }.issubset(commands[0])
+                all(
+                    {"-o", "Je", "-q", "--verify-ip"}.issubset(command)
+                    for command in commands
+                )
             )
             self.assertEqual(
                 resolver_files,
-                ["1.1.1.1\n8.8.8.8\n"],
+                [
+                    "1.1.1.1\n8.8.8.8\n",
+                    "1.1.1.1\n8.8.8.8\n",
+                ],
             )
-            self.assertEqual(input_domains, ["live.example"])
+            self.assertEqual(
+                input_batches,
+                [["live.example"], ["live.example"]],
+            )
 
-    def test_dnsx_jsonl_keeps_only_domains_with_addresses(self) -> None:
+    def test_massdns_jsonl_keeps_only_domains_with_addresses(self) -> None:
         with sqlite3.connect(":memory:") as connection:
             builder._initialize_database(connection)
             connection.executemany(
@@ -282,13 +343,19 @@ class DnsClassificationTest(unittest.TestCase):
                     ("missing.example", 0),
                 ],
             )
-            builder._store_dnsx_results(
+            builder._store_massdns_results(
                 connection,
                 [
-                    '{"host":"dead.example","status_code":"NOERROR"}\n',
-                    '{"host":"wild.example","a":[],"aaaa":[]}\n',
-                    '{"host":"live.example","a":["192.0.2.1"]}\n',
-                    '{"host":"v6.example","aaaa":["2001:db8::1"]}\n',
+                    '{"name":"dead.example.","type":"A",'
+                    '"status":"NXDOMAIN"}\n',
+                    '{"name":"wild.example.","type":"A",'
+                    '"status":"NOERROR","data":{"answers":[]}}\n',
+                    '{"name":"live.example.","type":"A",'
+                    '"status":"NOERROR","data":{"answers":['
+                    '{"type":"A","data":"192.0.2.1"}]}}\n',
+                    '{"name":"v6.example.","type":"AAAA",'
+                    '"status":"NOERROR","data":{"answers":['
+                    '{"type":"AAAA","data":"2001:db8::1"}]}}\n',
                 ],
             )
             connection.execute(
