@@ -172,7 +172,13 @@ class DnsClassificationTest(unittest.TestCase):
                             "name": f"{domain}.",
                             "type": query_type,
                             "status": (
-                                "NOERROR" if has_address else "NXDOMAIN"
+                                "NOERROR"
+                                if has_address
+                                or (
+                                    domain == "d.example"
+                                    and query_type == "A"
+                                )
+                                else "NXDOMAIN"
                             ),
                         }
                         if has_address:
@@ -215,15 +221,9 @@ class DnsClassificationTest(unittest.TestCase):
                 calls,
                 [
                     ("A", ["a.example", "b.example"]),
-                    ("AAAA", ["a.example", "b.example"]),
-                    ("A", ["b.example"]),
-                    ("AAAA", ["b.example"]),
                     ("A", ["c.example", "d.example"]),
-                    ("AAAA", ["c.example", "d.example"]),
+                    ("AAAA", ["d.example"]),
                     ("A", ["e.example"]),
-                    ("AAAA", ["e.example"]),
-                    ("A", ["e.example"]),
-                    ("AAAA", ["e.example"]),
                 ],
             )
             self.assertEqual(counts, {"adblock": 3})
@@ -265,25 +265,21 @@ class DnsClassificationTest(unittest.TestCase):
                 )
                 output_path = Path(command[command.index("-w") + 1])
                 query_type = command[command.index("-t") + 1]
-                address = (
-                    "93.184.216.34"
-                    if query_type == "A"
-                    else "2606:4700:4700::1111"
-                )
+                answers = []
+                if query_type == "AAAA":
+                    answers = [
+                        {
+                            "type": "AAAA",
+                            "data": "2606:4700:4700::1111",
+                        }
+                    ]
                 output_path.write_text(
                     json.dumps(
                         {
                             "name": "live.example.",
                             "type": query_type,
                             "status": "NOERROR",
-                            "data": {
-                                "answers": [
-                                    {
-                                        "type": query_type,
-                                        "data": address,
-                                    }
-                                ]
-                            },
+                            "data": {"answers": answers},
                         }
                     )
                     + "\n",
@@ -415,7 +411,7 @@ class DnsClassificationTest(unittest.TestCase):
                 ).splitlines()
                 calls.append((resolver_text, query_type, domains))
                 output_path = Path(command[command.index("-w") + 1])
-                retry = command[command.index("-s") + 1] == "100"
+                retry = command[command.index("-s") + 1] == "200"
                 rows = []
                 for domain in domains:
                     status = "SERVFAIL"
@@ -484,28 +480,117 @@ class DnsClassificationTest(unittest.TestCase):
                 list(connection.execute("SELECT domain FROM removed")),
                 [("dead.example",)],
             )
-            self.assertEqual(len(calls), 6)
+            self.assertEqual(len(calls), 4)
             self.assertEqual(
                 [call[0] for call in calls],
                 [
                     "1.1.1.1\n8.8.8.8\n",
                     "1.1.1.1\n8.8.8.8\n",
-                    "1.1.1.1\n",
-                    "1.1.1.1\n",
-                    "8.8.8.8\n",
-                    "8.8.8.8\n",
+                    "1.1.1.1\n8.8.8.8\n",
+                    "1.1.1.1\n8.8.8.8\n",
                 ],
             )
             self.assertEqual(
-                calls[2][2],
+                [(call[1], call[2]) for call in calls],
                 [
-                    "dead.example",
-                    "recovered.example",
-                    "unknown.example",
+                    (
+                        "A",
+                        [
+                            "dead.example",
+                            "recovered.example",
+                            "resolved.example",
+                            "unknown.example",
+                        ],
+                    ),
+                    (
+                        "AAAA",
+                        ["recovered.example", "unknown.example"],
+                    ),
+                    (
+                        "A",
+                        ["recovered.example", "unknown.example"],
+                    ),
+                    ("AAAA", ["unknown.example"]),
                 ],
             )
 
 class BuildTest(unittest.TestCase):
+    def test_collapses_descendants_only_under_retained_same_category_parent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "adblock.txt").write_text(
+                "\n".join(
+                    [
+                        "example.com",
+                        "a.example.com",
+                        "b.a.example.com",
+                        "dead-parent.com",
+                        "live.dead-parent.com",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (root / "privacy.txt").write_text(
+                "a.example.com",
+                encoding="utf-8",
+            )
+            config = {
+                "sources": [
+                    {
+                        "name": "adblock",
+                        "category": "adblock",
+                        "format": "domains",
+                        "path": "adblock.txt",
+                    },
+                    {
+                        "name": "privacy",
+                        "category": "privacy",
+                        "format": "domains",
+                        "path": "privacy.txt",
+                    },
+                ],
+            }
+
+            def validate(
+                connection: sqlite3.Connection,
+                _dns_config: dict,
+            ) -> None:
+                connection.execute(
+                    """
+                    CREATE TABLE dns_resolved (
+                        domain TEXT PRIMARY KEY
+                    ) WITHOUT ROWID
+                    """
+                )
+                connection.executemany(
+                    "INSERT INTO dns_resolved VALUES (?)",
+                    [
+                        ("example.com",),
+                        ("a.example.com",),
+                        ("b.a.example.com",),
+                        ("live.dead-parent.com",),
+                    ],
+                )
+
+            counts = build(
+                config=config,
+                base_directory=root,
+                output_directory=root / "output",
+                dns_validator=validate,
+            )
+
+            self.assertEqual(counts, {"adblock": 2, "privacy": 1})
+            self.assertEqual(
+                (root / "output/adblock.txt").read_text(encoding="utf-8"),
+                "example.com\nlive.dead-parent.com",
+            )
+            self.assertEqual(
+                (root / "output/privacy.txt").read_text(encoding="utf-8"),
+                "a.example.com",
+            )
+
     def test_output_has_no_trailing_newline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output_path = Path(directory) / "domains.txt"

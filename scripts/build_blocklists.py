@@ -35,7 +35,8 @@ DOMAIN_PATTERN = re.compile(
 VALID_SCOPES = {"auto", "host", "suffix"}
 PROGRESS_HEARTBEAT_SECONDS = 30
 DNS_BATCH_SIZE = 10_000
-DNS_RETRY_HASHMAP_SIZE = 100
+DNS_PRIMARY_HASHMAP_SIZE = 800
+DNS_RETRY_HASHMAP_SIZE = 200
 DomainEmitter = Callable[[str, str], None]
 
 
@@ -428,15 +429,14 @@ def _store_massdns_results(
             rows.append((domain,))
         if resolver is not None and query_type is not None:
             status = payload.get("status")
-            outcome = (
-                "resolved"
-                if has_address
-                else (
-                    "negative"
-                    if status in {"NOERROR", "NXDOMAIN"}
-                    else "unknown"
-                )
-            )
+            if has_address:
+                outcome = "resolved"
+            elif status == "NXDOMAIN":
+                outcome = "nxdomain"
+            elif status == "NOERROR":
+                outcome = "nodata"
+            else:
+                outcome = "unknown"
             observations.append(
                 (domain, resolver, query_type, outcome)
             )
@@ -499,6 +499,51 @@ def _remove_unresolved_domains(
           )
         """
     )
+
+
+def _collapse_parent_domains(
+    connection: sqlite3.Connection,
+) -> int:
+    connection.execute("DELETE FROM redundant")
+    changes_before = connection.total_changes
+    connection.execute(
+        """
+        WITH RECURSIVE ancestors(category, domain, parent) AS (
+            SELECT
+                child.category,
+                child.domain,
+                SUBSTR(child.domain, INSTR(child.domain, '.') + 1)
+            FROM domains AS child
+            WHERE INSTR(child.domain, '.') > 0
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM removed
+                  WHERE removed.domain = child.domain
+              )
+
+            UNION ALL
+
+            SELECT
+                category,
+                domain,
+                SUBSTR(parent, INSTR(parent, '.') + 1)
+            FROM ancestors
+            WHERE INSTR(parent, '.') > 0
+        )
+        INSERT OR IGNORE INTO redundant(category, domain)
+        SELECT ancestor.category, ancestor.domain
+        FROM ancestors AS ancestor
+        JOIN domains AS parent
+          ON parent.category = ancestor.category
+         AND parent.domain = ancestor.parent
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM removed
+            WHERE removed.domain = parent.domain
+        )
+        """
+    )
+    return connection.total_changes - changes_before
 
 
 def _consume_remote(
@@ -567,6 +612,11 @@ def _initialize_database(connection: sqlite3.Connection) -> None:
         CREATE TABLE dns_unknown (
             domain TEXT PRIMARY KEY
         ) WITHOUT ROWID;
+        CREATE TABLE redundant (
+            category TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            PRIMARY KEY (category, domain)
+        ) WITHOUT ROWID;
         """
     )
 
@@ -611,7 +661,9 @@ def _validate_dns_database(
     if not isinstance(resolvers, list) or not resolvers:
         raise ValueError("dns.resolvers must contain at least one resolver")
     command_timeout = int(dns_config.get("command_timeout_seconds", 3600))
-    hashmap_size = int(dns_config.get("hashmap_size", 500))
+    hashmap_size = int(
+        dns_config.get("hashmap_size", DNS_PRIMARY_HASHMAP_SIZE)
+    )
     resolve_count = int(dns_config.get("resolve_count", 3))
     executable = str(dns_config.get("executable", "massdns"))
     resolved_executable = shutil.which(executable)
@@ -636,6 +688,9 @@ def _validate_dns_database(
         CREATE TEMP TABLE dns_batch (
             domain TEXT PRIMARY KEY
         ) WITHOUT ROWID;
+        CREATE TEMP TABLE dns_phase (
+            domain TEXT PRIMARY KEY
+        ) WITHOUT ROWID;
         CREATE TEMP TABLE dns_retry_observations (
             domain TEXT NOT NULL,
             resolver TEXT NOT NULL,
@@ -643,6 +698,38 @@ def _validate_dns_database(
             outcome TEXT NOT NULL,
             PRIMARY KEY (domain, resolver, query_type)
         ) WITHOUT ROWID;
+        CREATE TEMP VIEW dns_phase_negative AS
+        SELECT phase.domain
+        FROM dns_phase AS phase
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM dns_resolved AS resolved
+            WHERE resolved.domain = phase.domain
+        )
+          AND (
+              EXISTS (
+                  SELECT 1
+                  FROM dns_retry_observations AS observation
+                  WHERE observation.domain = phase.domain
+                    AND observation.outcome = 'nxdomain'
+              )
+              OR (
+                  EXISTS (
+                      SELECT 1
+                      FROM dns_retry_observations AS observation
+                      WHERE observation.domain = phase.domain
+                        AND observation.query_type = 'A'
+                        AND observation.outcome = 'nodata'
+                  )
+                  AND EXISTS (
+                      SELECT 1
+                      FROM dns_retry_observations AS observation
+                      WHERE observation.domain = phase.domain
+                        AND observation.query_type = 'AAAA'
+                        AND observation.outcome = 'nodata'
+                  )
+              )
+          );
         """
     )
 
@@ -652,6 +739,10 @@ def _validate_dns_database(
         resolver_path = temporary / "resolvers.txt"
         output_path = temporary / "massdns.jsonl"
         error_path = temporary / "massdns.err"
+        resolver_path.write_text(
+            "".join(f"{resolver}\n" for resolver in resolvers),
+            encoding="utf-8",
+        )
         domain_cursor = connection.execute(
             """
             SELECT domain
@@ -673,101 +764,145 @@ def _validate_dns_database(
                 "INSERT INTO dns_batch VALUES (?)",
                 batch,
             )
-            with input_path.open("w", encoding="utf-8") as input_file:
-                for (domain,) in batch:
-                    input_file.write(f"{domain}\n")
 
             def run_massdns(
                 *,
-                input_file: Path,
-                active_resolvers: list[str],
+                query_type: str,
                 active_hashmap_size: int,
-                observed_resolver: str | None = None,
             ) -> None:
-                resolver_path.write_text(
-                    "".join(
-                        f"{resolver}\n" for resolver in active_resolvers
-                    ),
-                    encoding="utf-8",
-                )
-                for active_query_type in ("A", "AAAA"):
-                    command = [
-                        resolved_executable,
-                        "-r",
-                        str(resolver_path),
-                        "-t",
-                        active_query_type,
-                        "-o",
-                        "Je",
-                        "-q",
-                        "-c",
-                        str(resolve_count),
-                        "-s",
-                        str(active_hashmap_size),
-                        "--verify-ip",
-                        "-w",
-                        str(output_path),
-                        str(input_file),
-                    ]
-                    with error_path.open("w", encoding="utf-8") as errors:
-                        try:
-                            subprocess.run(
-                                command,
-                                stderr=errors,
-                                check=True,
-                                timeout=command_timeout,
-                            )
-                        except (
-                            subprocess.CalledProcessError,
-                            subprocess.TimeoutExpired,
-                        ) as error:
-                            raise RuntimeError(
-                                f"massdns {active_query_type} failed on "
-                                f"batch {batch_index}/{total_batches}"
-                            ) from error
-
-                    with output_path.open(encoding="utf-8") as output:
-                        _store_massdns_results(
-                            connection,
-                            output,
-                            resolver=observed_resolver,
-                            query_type=active_query_type,
+                command = [
+                    resolved_executable,
+                    "-r",
+                    str(resolver_path),
+                    "-t",
+                    query_type,
+                    "-o",
+                    "Je",
+                    "-q",
+                    "-c",
+                    str(resolve_count),
+                    "-s",
+                    str(active_hashmap_size),
+                    "--verify-ip",
+                    "-w",
+                    str(output_path),
+                    str(input_path),
+                ]
+                with error_path.open("w", encoding="utf-8") as errors:
+                    try:
+                        subprocess.run(
+                            command,
+                            stderr=errors,
+                            check=True,
+                            timeout=command_timeout,
                         )
+                    except (
+                        subprocess.CalledProcessError,
+                        subprocess.TimeoutExpired,
+                    ) as error:
+                        raise RuntimeError(
+                            f"massdns {query_type} failed on batch "
+                            f"{batch_index}/{total_batches}"
+                        ) from error
 
-            run_massdns(
-                input_file=input_path,
-                active_resolvers=resolvers,
-                active_hashmap_size=hashmap_size,
-            )
-
-            retry_domains = list(
-                connection.execute(
-                    """
-                    SELECT batch.domain
-                    FROM dns_batch AS batch
-                    WHERE NOT EXISTS (
-                        SELECT 1
-                        FROM dns_resolved AS resolved
-                        WHERE resolved.domain = batch.domain
+                with output_path.open(encoding="utf-8") as output:
+                    _store_massdns_results(
+                        connection,
+                        output,
+                        resolver="pool",
+                        query_type=query_type,
                     )
-                    ORDER BY batch.domain
-                    """
-                )
-            )
-            connection.execute("DELETE FROM dns_retry_observations")
-            if retry_domains:
+
+            def write_input(rows: Iterable[tuple[str]]) -> None:
                 with input_path.open("w", encoding="utf-8") as input_file:
-                    for (domain,) in retry_domains:
+                    for (domain,) in rows:
                         input_file.write(f"{domain}\n")
-                for resolver in resolvers:
+
+            def run_phase(
+                rows: list[tuple[str]],
+                active_hashmap_size: int,
+            ) -> tuple[int, list[tuple[str]]]:
+                connection.execute("DELETE FROM dns_phase")
+                connection.execute("DELETE FROM dns_retry_observations")
+                connection.executemany(
+                    "INSERT INTO dns_phase VALUES (?)",
+                    rows,
+                )
+                write_input(rows)
+                run_massdns(
+                    query_type="A",
+                    active_hashmap_size=active_hashmap_size,
+                )
+
+                aaaa_rows = list(
+                    connection.execute(
+                        """
+                        SELECT phase.domain
+                        FROM dns_phase AS phase
+                        WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM dns_resolved AS resolved
+                            WHERE resolved.domain = phase.domain
+                        )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM dns_retry_observations AS observation
+                              WHERE observation.domain = phase.domain
+                                AND observation.query_type = 'A'
+                                AND observation.outcome = 'nxdomain'
+                          )
+                        ORDER BY phase.domain
+                        """
+                    )
+                )
+                if aaaa_rows:
+                    write_input(aaaa_rows)
                     run_massdns(
-                        input_file=input_path,
-                        active_resolvers=[resolver],
-                        active_hashmap_size=DNS_RETRY_HASHMAP_SIZE,
-                        observed_resolver=resolver,
+                        query_type="AAAA",
+                        active_hashmap_size=active_hashmap_size,
                     )
 
-            required_negatives = len(resolvers) * 2
+                negative_count = connection.execute(
+                    "SELECT COUNT(*) FROM dns_phase_negative"
+                ).fetchone()[0]
+                unresolved_rows = list(
+                    connection.execute(
+                        """
+                        SELECT phase.domain
+                        FROM dns_phase AS phase
+                        WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM dns_resolved AS resolved
+                            WHERE resolved.domain = phase.domain
+                        )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM dns_phase_negative AS negative
+                              WHERE negative.domain = phase.domain
+                          )
+                        ORDER BY phase.domain
+                        """
+                    )
+                )
+                return negative_count, unresolved_rows
+
+            primary_removed, retry_domains = run_phase(
+                batch,
+                hashmap_size,
+            )
+            retry_removed = 0
+            final_unknown: list[tuple[str]] = []
+            if retry_domains:
+                retry_removed, final_unknown = run_phase(
+                    retry_domains,
+                    DNS_RETRY_HASHMAP_SIZE,
+                )
+            if final_unknown:
+                connection.executemany(
+                    "INSERT OR IGNORE INTO dns_unknown VALUES (?)",
+                    final_unknown,
+                )
+
             batch_resolved = connection.execute(
                 """
                 SELECT COUNT(*)
@@ -779,44 +914,8 @@ def _validate_dns_database(
                 )
                 """
             ).fetchone()[0]
-            batch_removed = connection.execute(
-                """
-                SELECT COUNT(*)
-                FROM dns_batch AS batch
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM dns_resolved AS resolved
-                    WHERE resolved.domain = batch.domain
-                )
-                  AND (
-                      SELECT COUNT(*)
-                      FROM dns_retry_observations AS observation
-                      WHERE observation.domain = batch.domain
-                        AND observation.outcome = 'negative'
-                  ) = ?
-                """,
-                (required_negatives,),
-            ).fetchone()[0]
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO dns_unknown(domain)
-                SELECT batch.domain
-                FROM dns_batch AS batch
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM dns_resolved AS resolved
-                    WHERE resolved.domain = batch.domain
-                )
-                  AND (
-                      SELECT COUNT(*)
-                      FROM dns_retry_observations AS observation
-                      WHERE observation.domain = batch.domain
-                        AND observation.outcome = 'negative'
-                  ) < ?
-                """,
-                (required_negatives,),
-            )
-            batch_unknown = len(batch) - batch_resolved - batch_removed
+            batch_removed = primary_removed + retry_removed
+            batch_unknown = len(final_unknown)
             processed_count += len(batch)
             resolved_count += batch_resolved
             unknown_count += batch_unknown
@@ -989,6 +1088,20 @@ def build(
                     flush=True,
                 )
 
+            print(
+                f"{dns_step_label} Parent-domain collapse started",
+                flush=True,
+            )
+            with _progress_heartbeat(
+                f"{dns_step_label} Parent-domain collapse"
+            ):
+                collapsed_count = _collapse_parent_domains(connection)
+            print(
+                f"{dns_step_label} Parent-domain collapse complete: "
+                f"{_quantity(collapsed_count, 'record')} removed",
+                flush=True,
+            )
+
             output_counts: dict[str, int] = {}
             for category in categories:
                 count = connection.execute(
@@ -999,6 +1112,11 @@ def build(
                       AND NOT EXISTS (
                           SELECT 1 FROM removed AS r
                           WHERE r.domain = d.domain
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM redundant
+                          WHERE redundant.category = d.category
+                            AND redundant.domain = d.domain
                       )
                     """,
                     (category,),
@@ -1026,6 +1144,11 @@ def build(
                       AND NOT EXISTS (
                           SELECT 1 FROM removed AS r
                           WHERE r.domain = d.domain
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM redundant
+                          WHERE redundant.category = d.category
+                            AND redundant.domain = d.domain
                       )
                     ORDER BY d.domain
                     """,

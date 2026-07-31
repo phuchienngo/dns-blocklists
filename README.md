@@ -59,16 +59,23 @@ DNS validation runs in batches of 10,000 domains. After every batch, the log
 reports cumulative processed, kept, removed, and unknown counts. This provides
 exact progress without loading the full domain list into RAM.
 
+Before writing each category, descendants are collapsed when a retained parent
+domain already exists in the same category. For example, `a.example.com` and
+`b.a.example.com` are omitted when `example.com` is present. Categories remain
+independent, and a parent removed by DNS validation does not suppress its
+children.
+
 ## DNS validation
 
-MassDNS first runs separate A and AAAA passes against the unfiltered resolvers
-configured in `sources.yaml`, using a hash-map size of 500. Domains without a
-global address are retried against each resolver independently with a lower
-hash-map size of 100.
+MassDNS first queries A records against the unfiltered resolver pool configured
+in `sources.yaml`, using a hash-map size of 800. AAAA is queried only for names
+without a global A address and without an NXDOMAIN response. Only transient or
+missing results are retried, using the same resolver pool with a lower hash-map
+size of 200.
 
 - A domain with any globally routable A or AAAA answer is kept.
-- A domain is removed only when every resolver independently returns NXDOMAIN
-  or NODATA for both A and AAAA.
+- NXDOMAIN is removed without an unnecessary AAAA query; NODATA is removed
+  after both A and AAAA return no address.
 - A domain with timeout, SERVFAIL, REFUSED, or missing output after retry is
   classified as unknown and kept to avoid false removal.
 - Sinkhole and non-routable addresses such as unspecified, loopback, private,
