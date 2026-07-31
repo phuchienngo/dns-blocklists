@@ -415,7 +415,7 @@ def _store_massdns_results(
 def _store_dnsx_results(
     connection: sqlite3.Connection,
     lines: Iterable[str],
-) -> int:
+) -> tuple[int, int]:
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS dns_resolved (
@@ -424,7 +424,9 @@ def _store_dnsx_results(
         """
     )
     resolved_changes = 0
+    negative_changes = 0
     rows: list[tuple[str]] = []
+    negative_rows: list[tuple[str]] = []
     for line_number, raw_line in enumerate(lines, start=1):
         if not raw_line.strip():
             continue
@@ -463,6 +465,17 @@ def _store_dnsx_results(
                 break
         if has_address:
             rows.append((domain,))
+        else:
+            status = payload.get("status_code")
+            explicit_nodata = (
+                status == "NOERROR"
+                and "a" in payload
+                and "aaaa" in payload
+                and not payload["a"]
+                and not payload["aaaa"]
+            )
+            if status == "NXDOMAIN" or explicit_nodata:
+                negative_rows.append((domain,))
         if len(rows) >= 5000:
             changes_before = connection.total_changes
             connection.executemany(
@@ -471,6 +484,14 @@ def _store_dnsx_results(
             )
             resolved_changes += connection.total_changes - changes_before
             rows.clear()
+        if len(negative_rows) >= 5000:
+            changes_before = connection.total_changes
+            connection.executemany(
+                "INSERT OR IGNORE INTO dnsx_negative VALUES (?)",
+                negative_rows,
+            )
+            negative_changes += connection.total_changes - changes_before
+            negative_rows.clear()
     if rows:
         changes_before = connection.total_changes
         connection.executemany(
@@ -478,7 +499,14 @@ def _store_dnsx_results(
             rows,
         )
         resolved_changes += connection.total_changes - changes_before
-    return resolved_changes
+    if negative_rows:
+        changes_before = connection.total_changes
+        connection.executemany(
+            "INSERT OR IGNORE INTO dnsx_negative VALUES (?)",
+            negative_rows,
+        )
+        negative_changes += connection.total_changes - changes_before
+    return resolved_changes, negative_changes
 
 
 def _remove_unresolved_domains(
@@ -498,6 +526,18 @@ def _remove_unresolved_domains(
             FROM dns_resolved AS resolved
             WHERE resolved.domain = global_domains.domain
         )
+          AND (
+              EXISTS (
+                  SELECT 1
+                  FROM dnsx_negative AS negative
+                  WHERE negative.domain = global_domains.domain
+              )
+              OR NOT EXISTS (
+                  SELECT 1
+                  FROM dns_unknown AS unknown
+                  WHERE unknown.domain = global_domains.domain
+              )
+          )
         """
     )
 
@@ -602,6 +642,9 @@ def _initialize_database(connection: sqlite3.Connection) -> None:
             domain TEXT PRIMARY KEY
         ) WITHOUT ROWID;
         CREATE TABLE dns_unknown (
+            domain TEXT PRIMARY KEY
+        ) WITHOUT ROWID;
+        CREATE TABLE dnsx_negative (
             domain TEXT PRIMARY KEY
         ) WITHOUT ROWID;
         CREATE TABLE redundant (
@@ -955,6 +998,7 @@ def _validate_dns_database(
             )
             dnsx_processed = 0
             recovered_count = 0
+            dnsx_removed_count = 0
             dnsx_batch_index = 0
             while dnsx_batch := dnsx_cursor.fetchmany(DNSX_BATCH_SIZE):
                 dnsx_batch_index += 1
@@ -995,10 +1039,12 @@ def _validate_dns_database(
                             f"{total_dnsx_batches}"
                         ) from error
                 with dnsx_output_path.open(encoding="utf-8") as output:
-                    recovered_count += _store_dnsx_results(
+                    batch_recovered, batch_removed = _store_dnsx_results(
                         connection,
                         output,
                     )
+                    recovered_count += batch_recovered
+                    dnsx_removed_count += batch_removed
                 dnsx_processed += len(dnsx_batch)
                 dnsx_progress_label = (
                     dnsx_progress_formatter(
@@ -1014,7 +1060,8 @@ def _validate_dns_database(
                     f"{dnsx_processed:,}/{pending_count:,} "
                     f"({dnsx_processed / pending_count * 100:.1f}%), "
                     f"recovered {recovered_count:,}, removed "
-                    f"{dnsx_processed - recovered_count:,}",
+                    f"{dnsx_removed_count:,}, unknown "
+                    f"{dnsx_processed - recovered_count - dnsx_removed_count:,}",
                     flush=True,
                 )
             dnsx_end_label = (
@@ -1025,7 +1072,9 @@ def _validate_dns_database(
             print(
                 f"{dnsx_end_label + ' ' if dnsx_end_label else ''}"
                 f"dnsx fallback complete: recovered {recovered_count:,}, "
-                f"removed {pending_count - recovered_count:,}",
+                f"removed {dnsx_removed_count:,}, unknown "
+                f"{pending_count - recovered_count - dnsx_removed_count:,} "
+                "kept",
                 flush=True,
             )
         else:

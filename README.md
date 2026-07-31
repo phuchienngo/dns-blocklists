@@ -45,19 +45,20 @@ parsed with `dnspython`; only owners redirected by `CNAME .` are treated as
 blocked domains.
 
 The build fails instead of publishing partial output when a source is
-unavailable or MassDNS itself cannot complete.
+unavailable or either DNS validator cannot complete.
 
 The build logs real completed work without timer heartbeats. Overall progress is
 split into download (0-10%), parse and merge (10-30%), MassDNS (30-90%), and
 dnsx fallback (90-100%). Download and parse advance after each source; MassDNS
-and dnsx advance after each completed batch. dnsx reports recovered and removed
-counts, or reports that it was skipped when MassDNS produced no unknown domains.
+and dnsx advance after each completed batch. dnsx reports recovered, explicitly
+removed, and still-unknown counts, or reports that it was skipped when MassDNS
+produced no unknown domains.
 
 MassDNS validation runs in batches of 10,000 domains. After every batch, the
 log reports cumulative processed, resolved, removed, and dnsx-pending counts.
 The dnsx fallback processes batches of 2,000 and logs cumulative processed,
-recovered, and removed counts. This provides exact progress without loading the
-full domain list into RAM.
+recovered, explicitly removed, and still-unknown counts. This provides exact
+progress without loading the full domain list into RAM.
 
 Before writing the output, descendants are collapsed when a retained parent
 domain already exists. For example, `a.example.com` and `b.a.example.com` are
@@ -70,15 +71,18 @@ MassDNS first queries A records against the unfiltered resolver pool configured
 in `sources.yaml`, using a hash-map size of 800. AAAA is queried only for names
 without a global A address and without an NXDOMAIN response. Only transient or
 missing results are retried, using the same resolver pool with a lower hash-map
-size of 200. Remaining unknown domains are passed to dnsx once, with A and AAAA
-queries, the same resolver pool, and three retries.
+size of 200. Remaining unknown domains are passed to dnsx in batches, with A and
+AAAA queries, the same resolver pool, and three retries.
 
 - A domain with any globally routable A or AAAA answer is kept.
 - NXDOMAIN is removed without an unnecessary AAAA query; NODATA is removed
   after both A and AAAA return no address.
 - A domain with timeout, SERVFAIL, REFUSED, or missing MassDNS output is kept
   pending until dnsx rechecks it. If dnsx still returns no global A or AAAA
-  address, the domain is removed.
+  address, the domain remains unknown and is kept; missing dnsx output is not
+  treated as proof that the domain is dead.
+- An explicit dnsx NXDOMAIN, or NOERROR response containing empty A and AAAA
+  result sets, is removed. Transient response codes are not treated as dead.
 - Sinkhole and non-routable addresses such as unspecified, loopback, private,
   link-local, and reserved IPs do not count as resolved.
 

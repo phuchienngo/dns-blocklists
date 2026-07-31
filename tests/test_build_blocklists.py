@@ -356,7 +356,7 @@ class DnsClassificationTest(unittest.TestCase):
                 ],
             )
 
-    def test_dnsx_rechecks_massdns_unknown_and_removes_unresolved(self) -> None:
+    def test_dnsx_rechecks_massdns_unknown_and_keeps_unresolved(self) -> None:
         with sqlite3.connect(":memory:") as connection:
             builder._initialize_database(connection)
             connection.executemany(
@@ -492,7 +492,7 @@ class DnsClassificationTest(unittest.TestCase):
                         "SELECT domain FROM removed ORDER BY domain"
                     )
                 ),
-                [("dead.example",), ("still-unknown.example",)],
+                [("dead.example",)],
             )
             self.assertEqual(len(calls), 4)
             self.assertEqual(
@@ -532,17 +532,17 @@ class DnsClassificationTest(unittest.TestCase):
             )
             self.assertIn(
                 "[phase 4/4 | 95.0%] dnsx batch 1/2 complete: "
-                "processed 1/2 (50.0%), recovered 0, removed 1",
+                "processed 1/2 (50.0%), recovered 0, removed 0, unknown 1",
                 progress.getvalue(),
             )
             self.assertIn(
                 "[phase 4/4 | 100.0%] dnsx batch 2/2 complete: "
-                "processed 2/2 (100.0%), recovered 1, removed 1",
+                "processed 2/2 (100.0%), recovered 1, removed 0, unknown 1",
                 progress.getvalue(),
             )
             self.assertIn(
                 "[phase 4/4 | 100.0%] dnsx fallback complete: "
-                "recovered 1, removed 1",
+                "recovered 1, removed 0, unknown 1 kept",
                 progress.getvalue(),
             )
             self.assertEqual(
@@ -581,19 +581,43 @@ class DnsClassificationTest(unittest.TestCase):
                 ],
             )
 
-    def test_dnsx_keeps_only_global_a_or_aaaa_addresses(self) -> None:
+    def test_dnsx_classifies_addresses_negatives_and_unknown(self) -> None:
         with sqlite3.connect(":memory:") as connection:
             builder._initialize_database(connection)
-            builder._store_dnsx_results(
+            connection.executemany(
+                "INSERT INTO domains VALUES (?)",
+                [
+                    ("dead.example",),
+                    ("nodata.example",),
+                    ("private.example",),
+                    ("transient.example",),
+                    ("v4.example",),
+                    ("v6.example",),
+                ],
+            )
+            connection.execute(
+                "INSERT INTO dns_unknown SELECT domain FROM domains"
+            )
+            counts = builder._store_dnsx_results(
                 connection,
                 [
                     '{"host":"v4.example","a":["93.184.216.34"]}\n',
                     '{"host":"v6.example","aaaa":['
                     '"2606:4700:4700::1111"]}\n',
                     '{"host":"private.example","a":["127.0.0.1"]}\n',
+                    '{"host":"dead.example","status_code":"NXDOMAIN"}\n',
+                    '{"host":"nodata.example","status_code":"NOERROR",'
+                    '"a":[],"aaaa":[]}\n',
+                    '{"host":"transient.example",'
+                    '"status_code":"SERVFAIL"}\n',
                 ],
             )
+            connection.execute(
+                "CREATE TABLE removed(domain TEXT PRIMARY KEY) WITHOUT ROWID"
+            )
+            builder._remove_unresolved_domains(connection)
 
+            self.assertEqual(counts, (2, 2))
             self.assertEqual(
                 list(
                     connection.execute(
@@ -601,6 +625,14 @@ class DnsClassificationTest(unittest.TestCase):
                     )
                 ),
                 [("v4.example",), ("v6.example",)],
+            )
+            self.assertEqual(
+                list(
+                    connection.execute(
+                        "SELECT domain FROM removed ORDER BY domain"
+                    )
+                ),
+                [("dead.example",), ("nodata.example",)],
             )
 
 class BuildTest(unittest.TestCase):
