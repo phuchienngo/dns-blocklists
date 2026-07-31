@@ -200,12 +200,14 @@ class DnsClassificationTest(unittest.TestCase):
             log = output.getvalue()
             self.assertIn(
                 "[step 2/3 | 46.7%] DNS batch 1/3 complete: "
-                "processed 2/5 (40.0%), kept 1, removed 1",
+                "processed 2/5 (40.0%), resolved 1, removed 1, "
+                "pending dnsx 0",
                 log,
             )
             self.assertIn(
                 "[step 2/3 | 66.7%] DNS batch 3/3 complete: "
-                "processed 5/5 (100.0%), kept 3, removed 2",
+                "processed 5/5 (100.0%), resolved 3, removed 2, "
+                "pending dnsx 0",
                 log,
             )
 
@@ -354,7 +356,7 @@ class DnsClassificationTest(unittest.TestCase):
                 ],
             )
 
-    def test_massdns_retries_unresolved_and_keeps_unknown(self) -> None:
+    def test_dnsx_rechecks_massdns_unknown_and_removes_unresolved(self) -> None:
         with sqlite3.connect(":memory:") as connection:
             builder._initialize_database(connection)
             connection.executemany(
@@ -366,12 +368,36 @@ class DnsClassificationTest(unittest.TestCase):
                     ("dead.example",),
                     ("recovered.example",),
                     ("resolved.example",),
+                    ("still-unknown.example",),
                     ("unknown.example",),
                 ],
             )
             calls: list[tuple[str, str, list[str]]] = []
+            dnsx_commands: list[list[str]] = []
 
-            def complete_massdns(command, **_kwargs) -> None:
+            def complete_dns(command, **_kwargs) -> None:
+                if command[0] == "/dnsx":
+                    dnsx_commands.append(command)
+                    domains = Path(
+                        command[command.index("-l") + 1]
+                    ).read_text(encoding="utf-8").splitlines()
+                    self.assertEqual(
+                        domains,
+                        ["still-unknown.example", "unknown.example"],
+                    )
+                    Path(command[command.index("-o") + 1]).write_text(
+                        json.dumps(
+                            {
+                                "host": "unknown.example",
+                                "a": ["93.184.216.34"],
+                                "status_code": "NOERROR",
+                            }
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    return
+
                 query_type = command[command.index("-t") + 1]
                 resolver_text = Path(
                     command[command.index("-r") + 1]
@@ -429,12 +455,15 @@ class DnsClassificationTest(unittest.TestCase):
                 patch.object(
                     builder.shutil,
                     "which",
-                    return_value="/massdns",
+                    side_effect=lambda executable: {
+                        "massdns": "/massdns",
+                        "dnsx": "/dnsx",
+                    }[executable],
                 ),
                 patch.object(
                     builder.subprocess,
                     "run",
-                    side_effect=complete_massdns,
+                    side_effect=complete_dns,
                 ),
             ):
                 builder._validate_dns_database(
@@ -447,8 +476,12 @@ class DnsClassificationTest(unittest.TestCase):
                 builder._remove_unresolved_domains(connection)
 
             self.assertEqual(
-                list(connection.execute("SELECT domain FROM removed")),
-                [("dead.example",)],
+                list(
+                    connection.execute(
+                        "SELECT domain FROM removed ORDER BY domain"
+                    )
+                ),
+                [("dead.example",), ("still-unknown.example",)],
             )
             self.assertEqual(len(calls), 4)
             self.assertEqual(
@@ -460,6 +493,19 @@ class DnsClassificationTest(unittest.TestCase):
                     "1.1.1.1\n8.8.8.8\n",
                 ],
             )
+
+            self.assertEqual(len(dnsx_commands), 1)
+            dnsx_command = dnsx_commands[0]
+            self.assertTrue(
+                {
+                    "-a",
+                    "-aaaa",
+                    "-json",
+                    "-omit-raw",
+                    "-silent",
+                    "-duc",
+                }.issubset(dnsx_command)
+            )
             self.assertEqual(
                 [(call[1], call[2]) for call in calls],
                 [
@@ -469,19 +515,53 @@ class DnsClassificationTest(unittest.TestCase):
                             "dead.example",
                             "recovered.example",
                             "resolved.example",
+                            "still-unknown.example",
                             "unknown.example",
                         ],
                     ),
                     (
                         "AAAA",
-                        ["recovered.example", "unknown.example"],
+                        [
+                            "recovered.example",
+                            "still-unknown.example",
+                            "unknown.example",
+                        ],
                     ),
                     (
                         "A",
-                        ["recovered.example", "unknown.example"],
+                        [
+                            "recovered.example",
+                            "still-unknown.example",
+                            "unknown.example",
+                        ],
                     ),
-                    ("AAAA", ["unknown.example"]),
+                    (
+                        "AAAA",
+                        ["still-unknown.example", "unknown.example"],
+                    ),
                 ],
+            )
+
+    def test_dnsx_keeps_only_global_a_or_aaaa_addresses(self) -> None:
+        with sqlite3.connect(":memory:") as connection:
+            builder._initialize_database(connection)
+            builder._store_dnsx_results(
+                connection,
+                [
+                    '{"host":"v4.example","a":["93.184.216.34"]}\n',
+                    '{"host":"v6.example","aaaa":['
+                    '"2606:4700:4700::1111"]}\n',
+                    '{"host":"private.example","a":["127.0.0.1"]}\n',
+                ],
+            )
+
+            self.assertEqual(
+                list(
+                    connection.execute(
+                        "SELECT domain FROM dns_resolved ORDER BY domain"
+                    )
+                ),
+                [("v4.example",), ("v6.example",)],
             )
 
 class BuildTest(unittest.TestCase):

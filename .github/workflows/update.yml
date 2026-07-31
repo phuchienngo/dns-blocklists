@@ -17,7 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
-      MASSDNS_COMMIT: 6bfa47197d78e68b79041d494e280174cb2d6ae1
+      MASSDNS_VERSION: 1.1.0
+      DNSX_VERSION: 1.3.0
+      DNSX_LINUX_AMD64_SHA256: 1415020474886151a4820c62b9e68a315cc062f7f111a2fd13fda99047a809a6
 
     steps:
       - name: Check out repository
@@ -33,22 +35,29 @@ jobs:
       - name: Sync Python dependencies
         run: uv sync --locked
 
-      - name: Build and install pinned MassDNS
+      - name: Install pinned DNS validators
         run: |
-          massdns_temp="$(mktemp -d)"
-          git -C "$massdns_temp" init --quiet
-          git -C "$massdns_temp" remote add origin https://github.com/blechschmidt/massdns.git
-          git -C "$massdns_temp" fetch --quiet --depth 1 origin "$MASSDNS_COMMIT"
-          git -C "$massdns_temp" checkout --quiet --detach FETCH_HEAD
-          test "$(git -C "$massdns_temp" rev-parse HEAD)" = "$MASSDNS_COMMIT"
-          make -C "$massdns_temp" -j2
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          test "$(brew info --json=v2 massdns | jq -r '.formulae[0].versions.stable')" = "$MASSDNS_VERSION"
+          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install --force-bottle massdns
+          test "$(brew list --versions massdns)" = "massdns $MASSDNS_VERSION"
           mkdir -p "$HOME/.local/bin"
-          install -m 0755 "$massdns_temp/bin/massdns" "$HOME/.local/bin/massdns"
+          ln -s "$(brew --prefix massdns)/bin/massdns" "$HOME/.local/bin/massdns"
 
-      - name: Add MassDNS to PATH
+          dnsx_temp="$(mktemp -d)"
+          dnsx_archive="dnsx_${DNSX_VERSION}_linux_amd64.zip"
+          curl --fail --location --silent --show-error \
+            --output "$dnsx_temp/$dnsx_archive" \
+            "https://github.com/projectdiscovery/dnsx/releases/download/v${DNSX_VERSION}/${dnsx_archive}"
+          echo "${DNSX_LINUX_AMD64_SHA256}  $dnsx_temp/$dnsx_archive" | sha256sum --check
+          unzip -q "$dnsx_temp/$dnsx_archive" -d "$dnsx_temp"
+          install -m 0755 "$dnsx_temp/dnsx" "$HOME/.local/bin/dnsx"
+
+      - name: Add DNS validators to PATH
         run: |
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/massdns" --help >/dev/null 2>&1
+          "$HOME/.local/bin/dnsx" -version
 
       - name: Test
         run: uv run --locked python -m unittest discover -s tests -v

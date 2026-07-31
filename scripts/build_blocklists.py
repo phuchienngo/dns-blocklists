@@ -439,6 +439,75 @@ def _store_massdns_results(
     return resolved_changes
 
 
+def _store_dnsx_results(
+    connection: sqlite3.Connection,
+    lines: Iterable[str],
+) -> int:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dns_resolved (
+            domain TEXT PRIMARY KEY
+        ) WITHOUT ROWID
+        """
+    )
+    resolved_changes = 0
+    rows: list[tuple[str]] = []
+    for line_number, raw_line in enumerate(lines, start=1):
+        if not raw_line.strip():
+            continue
+        try:
+            payload = json.loads(raw_line)
+            domain = normalize_domain(payload["host"])
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"Invalid dnsx JSON on line {line_number}"
+            ) from error
+        if not domain:
+            continue
+
+        has_address = False
+        for key, version in (("a", 4), ("aaaa", 6)):
+            addresses = payload.get(key) or []
+            if not isinstance(addresses, list):
+                raise ValueError(
+                    f"Invalid dnsx answer on line {line_number}"
+                )
+            for value in addresses:
+                try:
+                    address = ipaddress.ip_address(value)
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"Invalid dnsx address on line {line_number}"
+                    ) from error
+                if (
+                    address.version == version
+                    and address.is_global
+                    and not address.is_multicast
+                ):
+                    has_address = True
+                    break
+            if has_address:
+                break
+        if has_address:
+            rows.append((domain,))
+        if len(rows) >= 5000:
+            changes_before = connection.total_changes
+            connection.executemany(
+                "INSERT OR IGNORE INTO dns_resolved VALUES (?)",
+                rows,
+            )
+            resolved_changes += connection.total_changes - changes_before
+            rows.clear()
+    if rows:
+        changes_before = connection.total_changes
+        connection.executemany(
+            "INSERT OR IGNORE INTO dns_resolved VALUES (?)",
+            rows,
+        )
+        resolved_changes += connection.total_changes - changes_before
+    return resolved_changes
+
+
 def _remove_unresolved_domains(
     connection: sqlite3.Connection,
 ) -> None:
@@ -456,11 +525,6 @@ def _remove_unresolved_domains(
             FROM dns_resolved AS resolved
             WHERE resolved.domain = global_domains.domain
         )
-          AND NOT EXISTS (
-              SELECT 1
-              FROM dns_unknown AS unknown
-              WHERE unknown.domain = global_domains.domain
-          )
         """
     )
 
@@ -618,6 +682,9 @@ def _validate_dns_database(
     resolved_executable = shutil.which(executable)
     if not resolved_executable:
         raise RuntimeError(f"massdns executable not found: {executable}")
+    dnsx_executable = shutil.which("dnsx")
+    if not dnsx_executable:
+        raise RuntimeError("dnsx executable not found: dnsx")
 
     total_domains = connection.execute(
         "SELECT COUNT(*) FROM (SELECT domain FROM domains GROUP BY domain)"
@@ -869,7 +936,6 @@ def _validate_dns_database(
             resolved_count += batch_resolved
             unknown_count += batch_unknown
             removed_count += batch_removed
-            kept_count = resolved_count + unknown_count
             percentage = processed_count / total_domains * 100
             current_progress_label = (
                 progress_formatter(processed_count / total_domains)
@@ -884,9 +950,75 @@ def _validate_dns_database(
             print(
                 f"{prefix}DNS batch {batch_index}/{total_batches} complete: "
                 f"processed {processed_count:,}/{total_domains:,} "
-                f"({percentage:.1f}%), kept {kept_count:,}, "
-                f"removed {removed_count:,}, unknown {unknown_count:,}, "
+                f"({percentage:.1f}%), resolved {resolved_count:,}, "
+                f"removed {removed_count:,}, "
+                f"pending dnsx {unknown_count:,}, "
                 f"elapsed {time.monotonic() - started_at:.0f}s",
+                flush=True,
+            )
+
+        pending_count = connection.execute(
+            "SELECT COUNT(*) FROM dns_unknown"
+        ).fetchone()[0]
+        if pending_count:
+            write_input(
+                connection.execute(
+                    "SELECT domain FROM dns_unknown ORDER BY domain"
+                )
+            )
+            dnsx_output_path = temporary / "dnsx.jsonl"
+            dnsx_error_path = temporary / "dnsx.err"
+            dnsx_output_path.touch()
+            print(
+                f"{progress_label + ' ' if progress_label else ''}"
+                f"dnsx fallback started: rechecking "
+                f"{_quantity(pending_count, 'domain')}",
+                flush=True,
+            )
+            command = [
+                dnsx_executable,
+                "-l",
+                str(input_path),
+                "-a",
+                "-aaaa",
+                "-json",
+                "-omit-raw",
+                "-silent",
+                "-retry",
+                "3",
+                "-r",
+                str(resolver_path),
+                "-duc",
+                "-o",
+                str(dnsx_output_path),
+            ]
+            fallback_label = (
+                f"{progress_label} dnsx fallback"
+                if progress_label
+                else "dnsx fallback"
+            )
+            with (
+                dnsx_error_path.open("w", encoding="utf-8") as errors,
+                _progress_heartbeat(fallback_label),
+            ):
+                try:
+                    subprocess.run(
+                        command,
+                        stderr=errors,
+                        check=True,
+                        timeout=command_timeout,
+                    )
+                except (
+                    subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired,
+                ) as error:
+                    raise RuntimeError("dnsx fallback failed") from error
+            with dnsx_output_path.open(encoding="utf-8") as output:
+                recovered_count = _store_dnsx_results(connection, output)
+            print(
+                f"{progress_label + ' ' if progress_label else ''}"
+                f"dnsx fallback complete: recovered {recovered_count:,}, "
+                f"removed {pending_count - recovered_count:,}",
                 flush=True,
             )
 

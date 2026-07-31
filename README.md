@@ -9,8 +9,9 @@ Input wildcards such as `*.example.com` become `example.com`.
 
 ## Build
 
-Install `uv` and provide a compatible
-[MassDNS](https://github.com/blechschmidt/massdns) executable on `PATH`. `uv`
+Install `uv` and provide compatible
+[MassDNS](https://github.com/blechschmidt/massdns) and
+[dnsx](https://github.com/projectdiscovery/dnsx) executables on `PATH`. `uv`
 provisions Python 3.12 and all locked Python dependencies automatically.
 
 ```bash
@@ -54,9 +55,11 @@ the total consists of all sources, DNS validation, and all output files. During
 DNS validation, each completed batch advances that overall percentage instead
 of leaving it fixed for the entire DNS step.
 
-DNS validation runs in batches of 10,000 domains. After every batch, the log
-reports cumulative processed, kept, removed, and unknown counts. This provides
-exact progress without loading the full domain list into RAM.
+MassDNS validation runs in batches of 10,000 domains. After every batch, the
+log reports cumulative processed, resolved, removed, and dnsx-pending counts.
+The dnsx fallback logs its start, completion, recovered count, and final removed
+count. This provides exact progress without loading the full domain list into
+RAM.
 
 Before writing the output, descendants are collapsed when a retained parent
 domain already exists. For example, `a.example.com` and `b.a.example.com` are
@@ -69,15 +72,18 @@ MassDNS first queries A records against the unfiltered resolver pool configured
 in `sources.yaml`, using a hash-map size of 800. AAAA is queried only for names
 without a global A address and without an NXDOMAIN response. Only transient or
 missing results are retried, using the same resolver pool with a lower hash-map
-size of 200.
+size of 200. Remaining unknown domains are passed to dnsx once, with A and AAAA
+queries, the same resolver pool, and three retries.
 
 - A domain with any globally routable A or AAAA answer is kept.
 - NXDOMAIN is removed without an unnecessary AAAA query; NODATA is removed
   after both A and AAAA return no address.
-- A domain with timeout, SERVFAIL, REFUSED, or missing output after retry is
-  classified as unknown and kept to avoid false removal.
+- A domain with timeout, SERVFAIL, REFUSED, or missing MassDNS output is kept
+  pending until dnsx rechecks it. If dnsx still returns no global A or AAAA
+  address, the domain is removed.
 - Sinkhole and non-routable addresses such as unspecified, loopback, private,
   link-local, and reserved IPs do not count as resolved.
 
-No DNS state is stored. GitHub Actions builds a pinned MassDNS commit from
-source without a cache, runs full validation weekly, and commits updated output.
+No DNS state is stored. GitHub Actions installs a pinned MassDNS Homebrew bottle
+and a checksum-verified pinned dnsx binary without a cache, runs full validation
+weekly, and commits updated output.
