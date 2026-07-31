@@ -1,7 +1,7 @@
 [project]
 name = "dns-blocklists"
 version = "0.1.0"
-description = "Build categorized, domain-only DNS blocklists"
+description = "Build a domain-only DNS blocklist"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "dnspython==2.8.0",

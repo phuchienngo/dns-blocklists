@@ -1,13 +1,11 @@
-# DNS blocklists
+# DNS blocklist
 
-Two independent, domain-only blocklists based on the sources used by Mullvad:
+One domain-only blocklist built from the inputs in `sources.yaml`:
 
-- `output/adblock.txt`
-- `output/privacy.txt`
+- `output/blocklist.txt`
 
-There is no combined list. Every output is lowercase, sorted, deduplicated, and
-contains plain domains only. Input wildcards such as `*.example.com` become
-`example.com`.
+The output is lowercase, sorted, deduplicated, and contains plain domains only.
+Input wildcards such as `*.example.com` become `example.com`.
 
 ## Build
 
@@ -26,22 +24,21 @@ To rebuild sources without performing or updating DNS validation:
 uv run --locked python scripts/build_blocklists.py --skip-dns
 ```
 
-Remote and local inputs are declared in `sources.yaml`. Supported input formats
-are `domains`, `hosts`, `adblock`, and `rpz`. Add manually maintained entries
-under `custom/`.
+Inputs are grouped by format in `sources.yaml`. Each group contains URLs or
+repository-relative paths. Supported groups are `domains`, `hosts`, `adblock`,
+and `rpz`; empty groups may be omitted.
 
-Output categories are derived directly from the `category` fields in
-`sources.yaml`; there are no configured minimum or maximum list sizes.
+There are no categories or configured minimum and maximum list sizes.
 
 Large inputs are processed as streams. Parsed domains, Adblock candidates,
-deduplication indexes, and resolved-domain markers are kept in a temporary
-SQLite database on disk; sorted TXT outputs are written row by row. RAM usage
+deduplication indexes, and resolved-domain markers are kept in temporary SQLite
+databases on disk; the sorted TXT output is written row by row. RAM usage
 therefore does not grow with the total number of input domains, but the system
 temporary directory must have enough free disk space for the build database and
 MassDNS JSONL output.
 
 Adblock syntax is parsed with `python-abp`; only blocking URL patterns that can
-be converted safely to a domain are kept. Exception, cosmetic, regular
+be converted safely to domains are kept. Exception, cosmetic, regular
 expression, and disabled (`badfilter`) rules are ignored. RPZ zone syntax is
 parsed with `dnspython`; only owners redirected by `CNAME .` are treated as
 blocked domains.
@@ -53,17 +50,18 @@ The build logs each source as it is processed, the DNS validation totals, each
 output as it is written, and the total elapsed time. Source processing and DNS
 validation emit a heartbeat every 30 seconds so a slow or stuck phase remains
 visible in CI logs. Every phase also includes its overall step and percentage;
-the total consists of all sources, DNS validation, and all output files.
+the total consists of all sources, DNS validation, and all output files. During
+DNS validation, each completed batch advances that overall percentage instead
+of leaving it fixed for the entire DNS step.
 
 DNS validation runs in batches of 10,000 domains. After every batch, the log
 reports cumulative processed, kept, removed, and unknown counts. This provides
 exact progress without loading the full domain list into RAM.
 
-Before writing each category, descendants are collapsed when a retained parent
-domain already exists in the same category. For example, `a.example.com` and
-`b.a.example.com` are omitted when `example.com` is present. Categories remain
-independent, and a parent removed by DNS validation does not suppress its
-children.
+Before writing the output, descendants are collapsed when a retained parent
+domain already exists. For example, `a.example.com` and `b.a.example.com` are
+omitted when `example.com` is present. A parent removed by DNS validation does
+not suppress its children.
 
 ## DNS validation
 

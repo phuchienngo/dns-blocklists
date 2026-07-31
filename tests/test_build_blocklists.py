@@ -17,8 +17,8 @@ from scripts.build_blocklists import (
 
 
 class ParseContentTest(unittest.TestCase):
-    def test_progress_quantity_pluralizes_category(self) -> None:
-        self.assertEqual(builder._quantity(2, "category"), "2 categories")
+    def test_progress_quantity_pluralizes_domain(self) -> None:
+        self.assertEqual(builder._quantity(2, "domain"), "2 domains")
 
     def test_stream_parser_accepts_one_shot_line_iterable(self) -> None:
         class OneShotLines:
@@ -29,19 +29,18 @@ class ParseContentTest(unittest.TestCase):
                 if self.iterated:
                     raise AssertionError("source was iterated more than once")
                 self.iterated = True
-                yield "||ads.example.com^\n"
-                yield "@@||allowed.example.com^\n"
+                yield "ads.example.com\n"
+                yield "allowed.example.com\n"
 
-        entries: list[tuple[str, str]] = []
+        entries: list[str] = []
         builder.parse_lines(
             OneShotLines(),
-            "adblock",
-            emit=lambda domain, scope: entries.append((domain, scope)),
+            emit=entries.append,
         )
 
-        self.assertEqual(entries, [("ads.example.com", "suffix")])
+        self.assertEqual(entries, ["ads.example.com", "allowed.example.com"])
 
-    def test_domains_preserve_exact_and_suffix_scope(self) -> None:
+    def test_domains_are_normalized(self) -> None:
         content = """
         # comment
         Example.COM
@@ -51,35 +50,11 @@ class ParseContentTest(unittest.TestCase):
         """
 
         self.assertEqual(
-            parse_content(content, "domains"),
-            {
-                "example.com": "suffix",
-                "exact.example.com": "host",
-            },
+            parse_content(content),
+            {"example.com", "exact.example.com"},
         )
 
-    def test_source_scope_can_force_suffix(self) -> None:
-        self.assertEqual(
-            parse_content("social.example.com\n", "domains", scope="suffix"),
-            {"social.example.com": "suffix"},
-        )
-
-    def test_hosts_extract_exact_domains(self) -> None:
-        content = """
-        0.0.0.0 ads.example.com tracker.example.com # comment
-        127.0.0.1 localhost
-        ::1 localhost
-        """
-
-        self.assertEqual(
-            parse_content(content, "hosts"),
-            {
-                "ads.example.com": "host",
-                "tracker.example.com": "host",
-            },
-        )
-
-    def test_adblock_ignores_exception_rules(self) -> None:
+    def test_adblock_extracts_domain_rules(self) -> None:
         content = """
         [Adblock Plus 2.0]
         ! comment
@@ -92,15 +67,16 @@ class ParseContentTest(unittest.TestCase):
         /regular-expression/
         """
 
+        try:
+            domains = parse_content(content, "adblock")
+        except Exception as error:
+            self.fail(f"adblock format was rejected: {error}")
         self.assertEqual(
-            parse_content(content, "adblock"),
-            {
-                "ads.example.com": "suffix",
-                "metrics.example.com": "suffix",
-            },
+            domains,
+            {"ads.example.com", "metrics.example.com"},
         )
 
-    def test_rpz_wildcard_makes_domain_a_suffix(self) -> None:
+    def test_rpz_extracts_cname_root_records(self) -> None:
         content = """
         $TTL 30
         @ IN SOA rpz.example. hostmaster.example. (
@@ -113,12 +89,13 @@ class ParseContentTest(unittest.TestCase):
         passthrough.example.com CNAME rpz-passthru.
         """
 
+        try:
+            domains = parse_content(textwrap.dedent(content), "rpz")
+        except Exception as error:
+            self.fail(f"RPZ format was rejected: {error}")
         self.assertEqual(
-            parse_content(textwrap.dedent(content), "rpz"),
-            {
-                "blocked.example.com": "suffix",
-                "exact.example.com": "host",
-            },
+            domains,
+            {"blocked.example.com", "exact.example.com"},
         )
 
 
@@ -141,14 +118,7 @@ class DnsClassificationTest(unittest.TestCase):
             )
             config = {
                 "dns": {"resolvers": ["1.1.1.1"]},
-                "sources": [
-                    {
-                        "name": "local",
-                        "category": "adblock",
-                        "format": "domains",
-                        "path": "domains.txt",
-                    }
-                ],
+                "sources": {"domains": ["domains.txt"]},
             }
             calls: list[tuple[str, list[str]]] = []
 
@@ -226,15 +196,15 @@ class DnsClassificationTest(unittest.TestCase):
                     ("A", ["e.example"]),
                 ],
             )
-            self.assertEqual(counts, {"adblock": 3})
+            self.assertEqual(counts, 3)
             log = output.getvalue()
             self.assertIn(
-                "[step 2/3 | 67%] DNS batch 1/3 complete: "
+                "[step 2/3 | 46.7%] DNS batch 1/3 complete: "
                 "processed 2/5 (40.0%), kept 1, removed 1",
                 log,
             )
             self.assertIn(
-                "[step 2/3 | 67%] DNS batch 3/3 complete: "
+                "[step 2/3 | 66.7%] DNS batch 3/3 complete: "
                 "processed 5/5 (100.0%), kept 3, removed 2",
                 log,
             )
@@ -244,8 +214,8 @@ class DnsClassificationTest(unittest.TestCase):
             builder._initialize_database(connection)
             connection.execute(
                 """
-                INSERT INTO domains(category, domain, scope)
-                VALUES ('adblock', 'live.example', 0)
+                INSERT INTO domains(domain)
+                VALUES ('live.example')
                 """
             )
             commands: list[list[str]] = []
@@ -332,17 +302,17 @@ class DnsClassificationTest(unittest.TestCase):
             builder._initialize_database(connection)
             connection.executemany(
                 """
-                INSERT INTO domains(category, domain, scope)
-                VALUES ('adblock', ?, ?)
+                INSERT INTO domains(domain)
+                VALUES (?)
                 """,
                 [
-                    ("dead.example", 0),
-                    ("wild.example", 1),
-                    ("live.example", 0),
-                    ("v6.example", 0),
-                    ("private.example", 0),
-                    ("multicast.example", 0),
-                    ("missing.example", 0),
+                    ("dead.example",),
+                    ("wild.example",),
+                    ("live.example",),
+                    ("v6.example",),
+                    ("private.example",),
+                    ("multicast.example",),
+                    ("missing.example",),
                 ],
             )
             builder._store_massdns_results(
@@ -389,8 +359,8 @@ class DnsClassificationTest(unittest.TestCase):
             builder._initialize_database(connection)
             connection.executemany(
                 """
-                INSERT INTO domains(category, domain, scope)
-                VALUES ('adblock', ?, 0)
+                INSERT INTO domains(domain)
+                VALUES (?)
                 """,
                 [
                     ("dead.example",),
@@ -515,42 +485,50 @@ class DnsClassificationTest(unittest.TestCase):
             )
 
 class BuildTest(unittest.TestCase):
-    def test_collapses_descendants_only_under_retained_same_category_parent(
-        self,
-    ) -> None:
+    def test_accepts_sources_grouped_by_format(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "adblock.txt").write_text(
+            config = {
+                "sources": {"adblock": ["memory://ads"]}
+            }
+
+            try:
+                count = build(
+                    config=config,
+                    base_directory=root,
+                    output_directory=root / "output",
+                    skip_dns=True,
+                    fetch_text=lambda _: "||ads.example.com^\n",
+                )
+            except Exception as error:
+                self.fail(f"grouped sources were rejected: {error}")
+
+            self.assertEqual(count, 1)
+            self.assertEqual(
+                (root / "output/blocklist.txt").read_text(encoding="utf-8"),
+                "ads.example.com",
+            )
+
+    def test_collapses_descendants_across_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "first.txt").write_text(
                 "\n".join(
                     [
                         "example.com",
                         "a.example.com",
-                        "b.a.example.com",
                         "dead-parent.com",
                         "live.dead-parent.com",
                     ]
                 ),
                 encoding="utf-8",
             )
-            (root / "privacy.txt").write_text(
-                "a.example.com",
+            (root / "second.txt").write_text(
+                "b.a.example.com",
                 encoding="utf-8",
             )
             config = {
-                "sources": [
-                    {
-                        "name": "adblock",
-                        "category": "adblock",
-                        "format": "domains",
-                        "path": "adblock.txt",
-                    },
-                    {
-                        "name": "privacy",
-                        "category": "privacy",
-                        "format": "domains",
-                        "path": "privacy.txt",
-                    },
-                ],
+                "sources": {"domains": ["first.txt", "second.txt"]}
             }
 
             def validate(
@@ -581,14 +559,10 @@ class BuildTest(unittest.TestCase):
                 dns_validator=validate,
             )
 
-            self.assertEqual(counts, {"adblock": 2, "privacy": 1})
+            self.assertEqual(counts, 2)
             self.assertEqual(
-                (root / "output/adblock.txt").read_text(encoding="utf-8"),
+                (root / "output/blocklist.txt").read_text(encoding="utf-8"),
                 "example.com\nlive.dead-parent.com",
-            )
-            self.assertEqual(
-                (root / "output/privacy.txt").read_text(encoding="utf-8"),
-                "a.example.com",
             )
 
     def test_output_has_no_trailing_newline(self) -> None:
@@ -612,16 +586,7 @@ class BuildTest(unittest.TestCase):
                 "ads.example.com\n",
                 encoding="utf-8",
             )
-            config = {
-                "sources": [
-                    {
-                        "name": "local-ads",
-                        "category": "adblock",
-                        "format": "domains",
-                        "path": "custom.txt",
-                    }
-                ],
-            }
+            config = {"sources": {"domains": ["custom.txt"]}}
             output = StringIO()
 
             def slow_validator(
@@ -654,7 +619,7 @@ class BuildTest(unittest.TestCase):
                 )
 
             self.assertIn(
-                "[step 2/3 | 67%] DNS validation still running (",
+                "[step 2/3 | 33.3%] DNS validation still running (",
                 output.getvalue(),
             )
 
@@ -665,16 +630,7 @@ class BuildTest(unittest.TestCase):
                 "ads.example.com\n",
                 encoding="utf-8",
             )
-            config = {
-                "sources": [
-                    {
-                        "name": "local-ads",
-                        "category": "adblock",
-                        "format": "domains",
-                        "path": "custom.txt",
-                    }
-                ],
-            }
+            config = {"sources": {"domains": ["custom.txt"]}}
             output = StringIO()
 
             with redirect_stdout(output):
@@ -688,27 +644,26 @@ class BuildTest(unittest.TestCase):
             log = output.getvalue()
             self.assertIn(
                 "Starting build: 3 total steps "
-                "(1 source, DNS validation, 1 category output)",
+                "(1 source, DNS validation, 1 output)",
                 log,
             )
             self.assertIn(
                 "[step 1/3 | 33%] [source 1/1] "
-                "Processing local-ads (adblock, domains)",
+                "Processing custom.txt",
                 log,
             )
             self.assertIn(
                 "[step 1/3 | 33%] [source 1/1] "
-                "Parsed local-ads: 1 domain",
+                "Parsed custom.txt: 1 domain",
                 log,
             )
             self.assertIn(
-                "[step 2/3 | 67%] DNS validation skipped: "
+                "[step 2/3 | 66.7%] DNS validation skipped: "
                 "retaining 1 unique domain",
                 log,
             )
             self.assertIn(
-                "[step 3/3 | 100%] [output 1/1] "
-                "Writing adblock.txt: 1 domain",
+                "[step 3/3 | 100%] Writing blocklist.txt: 1 domain",
                 log,
             )
             self.assertIn(
@@ -716,7 +671,7 @@ class BuildTest(unittest.TestCase):
                 log,
             )
 
-    def test_builds_separate_outputs_without_filtering_domains(self) -> None:
+    def test_builds_one_output_from_url_list(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "custom.txt").write_text(
@@ -724,21 +679,7 @@ class BuildTest(unittest.TestCase):
                 encoding="utf-8",
             )
             config = {
-                "sources": [
-                    {
-                        "name": "remote",
-                        "category": "adblock",
-                        "format": "domains",
-                        "url": "memory://ads",
-                    },
-                    {
-                        "name": "local",
-                        "category": "social",
-                        "format": "domains",
-                        "scope": "suffix",
-                        "path": "custom.txt",
-                    },
-                ],
+                "sources": {"domains": ["memory://ads", "custom.txt"]}
             }
 
             with patch.object(
@@ -746,23 +687,24 @@ class BuildTest(unittest.TestCase):
                 "parse_content",
                 side_effect=AssertionError("build loaded a whole source"),
             ):
-                counts = build(
-                    config=config,
-                    base_directory=root,
-                    output_directory=root / "output",
-                    skip_dns=True,
-                    fetch_text=lambda _: (
-                        "ads.example.com\nallowed.example.com\nads.example.com\n"
-                    ),
-                )
+                try:
+                    counts = build(
+                        config=config,
+                        base_directory=root,
+                        output_directory=root / "output",
+                        skip_dns=True,
+                        fetch_text=lambda _: (
+                            "ads.example.com\nallowed.example.com\n"
+                            "ads.example.com\n"
+                        ),
+                    )
+                except Exception as error:
+                    self.fail(f"URL-list config was rejected: {error}")
 
-            self.assertEqual(counts, {"adblock": 2, "social": 2})
+            self.assertEqual(counts, 4)
             self.assertEqual(
-                (root / "output/adblock.txt").read_text(encoding="utf-8"),
-                "ads.example.com\nallowed.example.com",
-            )
-            self.assertEqual(
-                (root / "output/social.txt").read_text(encoding="utf-8"),
+                (root / "output/blocklist.txt").read_text(encoding="utf-8"),
+                "ads.example.com\nallowed.example.com\n"
                 "local.example.com\nshared.example.com",
             )
     def test_dns_failure_keeps_existing_output(self) -> None:
@@ -770,18 +712,9 @@ class BuildTest(unittest.TestCase):
             root = Path(directory)
             output = root / "output"
             output.mkdir()
-            existing = output / "adblock.txt"
+            existing = output / "blocklist.txt"
             existing.write_text("existing.example.com\n", encoding="utf-8")
-            config = {
-                "sources": [
-                    {
-                        "name": "local",
-                        "category": "adblock",
-                        "format": "domains",
-                        "path": "custom.txt",
-                    }
-                ],
-            }
+            config = {"sources": {"domains": ["custom.txt"]}}
             (root / "custom.txt").write_text(
                 "new.example.com\n",
                 encoding="utf-8",
@@ -809,16 +742,7 @@ class BuildTest(unittest.TestCase):
                 "live.example.com\ndead.example.com\n",
                 encoding="utf-8",
             )
-            config = {
-                "sources": [
-                    {
-                        "name": "local",
-                        "category": "adblock",
-                        "format": "domains",
-                        "path": "custom.txt",
-                    }
-                ],
-            }
+            config = {"sources": {"domains": ["custom.txt"]}}
 
             def resolve(connection, _dns_config) -> None:
                 connection.execute(
@@ -836,9 +760,9 @@ class BuildTest(unittest.TestCase):
                 dns_validator=resolve,
             )
 
-            self.assertEqual(counts, {"adblock": 0})
+            self.assertEqual(counts, 0)
             self.assertEqual(
-                (root / "output/adblock.txt").read_text(encoding="utf-8"),
+                (root / "output/blocklist.txt").read_text(encoding="utf-8"),
                 "",
             )
 

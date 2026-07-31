@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
@@ -27,17 +28,15 @@ import dns.transaction
 import dns.zonefile
 from abp.filters import FilterAction, SelectorType, parse_filterlist
 
-
 DOMAIN_PATTERN = re.compile(
     r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
 )
-VALID_SCOPES = {"auto", "host", "suffix"}
 PROGRESS_HEARTBEAT_SECONDS = 30
 DNS_BATCH_SIZE = 10_000
 DNS_PRIMARY_HASHMAP_SIZE = 800
 DNS_RETRY_HASHMAP_SIZE = 200
-DomainEmitter = Callable[[str, str], None]
+DomainEmitter = Callable[[str], None]
 
 
 def _quantity(count: int, noun: str) -> str:
@@ -47,9 +46,18 @@ def _quantity(count: int, noun: str) -> str:
     return f"{count:,} {plural}"
 
 
-def _step_label(step: int, total_steps: int) -> str:
-    percentage = step / total_steps * 100
-    return f"[step {step}/{total_steps} | {percentage:.0f}%]"
+def _step_label(
+    step: int,
+    total_steps: int,
+    *,
+    progress: float = 1.0,
+    precision: int = 0,
+) -> str:
+    percentage = (step - 1 + progress) / total_steps * 100
+    return (
+        f"[step {step}/{total_steps} | "
+        f"{percentage:.{precision}f}%]"
+    )
 
 
 @contextmanager
@@ -92,40 +100,27 @@ def normalize_domain(value: str) -> str | None:
     return value
 
 
-def _emit_domain(
-    emit: DomainEmitter,
-    value: str,
-    *,
-    wildcard: bool = False,
-    source_scope: str = "auto",
-) -> None:
-    if source_scope not in VALID_SCOPES:
-        raise ValueError(f"Unsupported source scope: {source_scope}")
+def _emit_domain(emit: DomainEmitter, value: str) -> None:
     if value.startswith("*."):
-        wildcard = True
         value = value[2:]
     domain = normalize_domain(value)
-    if not domain:
-        return
-    scope = "suffix" if wildcard or source_scope == "suffix" else "host"
-    emit(domain, scope)
+    if domain:
+        emit(domain)
 
 
 def _parse_domains(
     lines: Iterable[str],
-    scope: str,
     emit: DomainEmitter,
 ) -> None:
     for raw_line in lines:
         line = raw_line.split("#", 1)[0].strip()
         if not line or line.startswith(("!", ";")):
             continue
-        _emit_domain(emit, line, source_scope=scope)
+        _emit_domain(emit, line)
 
 
 def _parse_hosts(
     lines: Iterable[str],
-    scope: str,
     emit: DomainEmitter,
 ) -> None:
     for raw_line in lines:
@@ -137,12 +132,11 @@ def _parse_hosts(
         except ValueError:
             continue
         for value in fields[1:]:
-            _emit_domain(emit, value, source_scope=scope)
+            _emit_domain(emit, value)
 
 
 def _parse_adblock(
     lines: Iterable[str],
-    scope: str,
     emit: DomainEmitter,
 ) -> None:
     def signature(entry: Any) -> tuple[Any, ...]:
@@ -167,12 +161,11 @@ def _parse_adblock(
             CREATE TABLE candidates (
                 signature TEXT PRIMARY KEY,
                 domain TEXT NOT NULL,
-                scope TEXT NOT NULL,
                 disabled INTEGER NOT NULL
             ) WITHOUT ROWID
             """
         )
-        rows: list[tuple[str, str, str, int]] = []
+        rows: list[tuple[str, str, int]] = []
         for entry in parse_filterlist(lines):
             if (
                 not hasattr(entry, "selector")
@@ -183,25 +176,15 @@ def _parse_adblock(
 
             pattern = entry.selector["value"]
             match = re.fullmatch(r"\|\|(.+)\^", pattern)
-            wildcard = match is not None
             value = match.group(1) if match else pattern
-            normalized: list[tuple[str, str]] = []
-            _emit_domain(
-                lambda domain, domain_scope: normalized.append(
-                    (domain, domain_scope)
-                ),
-                value,
-                wildcard=wildcard,
-                source_scope=scope,
-            )
+            normalized: list[str] = []
+            _emit_domain(normalized.append, value)
             if not normalized:
                 continue
-            domain, domain_scope = normalized[0]
             rows.append(
                 (
                     json.dumps(signature(entry), separators=(",", ":")),
-                    domain,
-                    domain_scope,
+                    normalized[0],
                     int(
                         any(
                             name == "badfilter" and value
@@ -214,7 +197,7 @@ def _parse_adblock(
                 filters.executemany(
                     """
                     INSERT INTO candidates
-                    VALUES (?, ?, ?, ?)
+                    VALUES (?, ?, ?)
                     ON CONFLICT(signature) DO UPDATE
                     SET disabled = MAX(disabled, excluded.disabled)
                     """,
@@ -225,28 +208,27 @@ def _parse_adblock(
             filters.executemany(
                 """
                 INSERT INTO candidates
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?)
                 ON CONFLICT(signature) DO UPDATE
                 SET disabled = MAX(disabled, excluded.disabled)
                 """,
                 rows,
             )
-        for domain, domain_scope in filters.execute(
+        for (domain,) in filters.execute(
             """
-            SELECT domain, scope
+            SELECT domain
             FROM candidates
             WHERE disabled = 0
             ORDER BY domain
             """
         ):
-            emit(domain, domain_scope)
+            emit(domain)
 
 
 class _RpzTransactionManager(dns.transaction.TransactionManager):
-    def __init__(self, emit: DomainEmitter, scope: str):
+    def __init__(self, emit: DomainEmitter):
         self.origin = dns.name.from_text("rpz.invalid.")
         self.emit = emit
-        self.scope = scope
 
     def reader(self):
         raise NotImplementedError
@@ -276,11 +258,7 @@ class _RpzTransaction(dns.transaction.Transaction):
         if rdataset.rdtype != dns.rdatatype.CNAME:
             return
         if any(record.target == dns.name.root for record in rdataset):
-            _emit_domain(
-                self.rpz_manager.emit,
-                name.to_text(),
-                source_scope=self.rpz_manager.scope,
-            )
+            _emit_domain(self.rpz_manager.emit, name.to_text())
 
     def _delete_name(self, name):
         pass
@@ -309,10 +287,9 @@ class _RpzTransaction(dns.transaction.Transaction):
 
 def _parse_rpz(
     lines: Iterable[str],
-    scope: str,
     emit: DomainEmitter,
 ) -> None:
-    manager = _RpzTransactionManager(emit, scope)
+    manager = _RpzTransactionManager(emit)
     with manager.writer(True) as transaction:
         tokenizer = dns.tokenizer.Tokenizer(lines, "<rpz>")
         reader = dns.zonefile.Reader(
@@ -326,10 +303,9 @@ def _parse_rpz(
 
 def parse_lines(
     lines: Iterable[str],
-    source_format: str,
+    source_format: str = "domains",
     *,
     emit: DomainEmitter,
-    scope: str = "auto",
 ) -> None:
     parsers = {
         "adblock": _parse_adblock,
@@ -341,27 +317,15 @@ def parse_lines(
         parser = parsers[source_format]
     except KeyError as error:
         raise ValueError(f"Unsupported source format: {source_format}") from error
-    parser(lines, scope, emit)
+    parser(lines, emit)
 
 
 def parse_content(
     content: str,
-    source_format: str,
-    *,
-    scope: str = "auto",
-) -> dict[str, str]:
-    domains: dict[str, str] = {}
-
-    def collect(domain: str, domain_scope: str) -> None:
-        if domains.get(domain) != "suffix":
-            domains[domain] = domain_scope
-
-    parse_lines(
-        StringIO(content),
-        source_format,
-        emit=collect,
-        scope=scope,
-    )
+    source_format: str = "domains",
+) -> set[str]:
+    domains: set[str] = set()
+    parse_lines(StringIO(content), source_format, emit=domains.add)
     return domains
 
 
@@ -508,9 +472,8 @@ def _collapse_parent_domains(
     changes_before = connection.total_changes
     connection.execute(
         """
-        WITH RECURSIVE ancestors(category, domain, parent) AS (
+        WITH RECURSIVE ancestors(domain, parent) AS (
             SELECT
-                child.category,
                 child.domain,
                 SUBSTR(child.domain, INSTR(child.domain, '.') + 1)
             FROM domains AS child
@@ -524,18 +487,16 @@ def _collapse_parent_domains(
             UNION ALL
 
             SELECT
-                category,
                 domain,
                 SUBSTR(parent, INSTR(parent, '.') + 1)
             FROM ancestors
             WHERE INSTR(parent, '.') > 0
         )
-        INSERT OR IGNORE INTO redundant(category, domain)
-        SELECT ancestor.category, ancestor.domain
+        INSERT OR IGNORE INTO redundant(domain)
+        SELECT ancestor.domain
         FROM ancestors AS ancestor
         JOIN domains AS parent
-          ON parent.category = ancestor.category
-         AND parent.domain = ancestor.parent
+          ON parent.domain = ancestor.parent
         WHERE NOT EXISTS (
             SELECT 1
             FROM removed
@@ -571,10 +532,10 @@ def _consume_remote(
 class _DomainBatch:
     def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
-        self.rows: list[tuple[str, int]] = []
+        self.rows: list[tuple[str]] = []
 
-    def emit(self, domain: str, scope: str) -> None:
-        self.rows.append((domain, 1 if scope == "suffix" else 0))
+    def emit(self, domain: str) -> None:
+        self.rows.append((domain,))
         if len(self.rows) >= 5000:
             self.flush()
 
@@ -583,10 +544,8 @@ class _DomainBatch:
             return
         self.connection.executemany(
             """
-            INSERT INTO source_domains(domain, scope)
-            VALUES (?, ?)
-            ON CONFLICT(domain) DO UPDATE
-            SET scope = MAX(scope, excluded.scope)
+            INSERT OR IGNORE INTO source_domains(domain)
+            VALUES (?)
             """,
             self.rows,
         )
@@ -600,22 +559,16 @@ def _initialize_database(connection: sqlite3.Connection) -> None:
         PRAGMA synchronous = OFF;
         PRAGMA temp_store = FILE;
         CREATE TABLE source_domains (
-            domain TEXT PRIMARY KEY,
-            scope INTEGER NOT NULL
+            domain TEXT PRIMARY KEY
         ) WITHOUT ROWID;
         CREATE TABLE domains (
-            category TEXT NOT NULL,
-            domain TEXT NOT NULL,
-            scope INTEGER NOT NULL,
-            PRIMARY KEY (category, domain)
+            domain TEXT PRIMARY KEY
         ) WITHOUT ROWID;
         CREATE TABLE dns_unknown (
             domain TEXT PRIMARY KEY
         ) WITHOUT ROWID;
         CREATE TABLE redundant (
-            category TEXT NOT NULL,
-            domain TEXT NOT NULL,
-            PRIMARY KEY (category, domain)
+            domain TEXT PRIMARY KEY
         ) WITHOUT ROWID;
         """
     )
@@ -625,11 +578,10 @@ def _parse_source_into_database(
     connection: sqlite3.Connection,
     lines: Iterable[str],
     source_format: str,
-    scope: str,
 ) -> int:
     connection.execute("DELETE FROM source_domains")
     batch = _DomainBatch(connection)
-    parse_lines(lines, source_format, emit=batch.emit, scope=scope)
+    parse_lines(lines, source_format, emit=batch.emit)
     batch.flush()
     return connection.execute(
         "SELECT COUNT(*) FROM source_domains"
@@ -638,16 +590,12 @@ def _parse_source_into_database(
 
 def _merge_source(
     connection: sqlite3.Connection,
-    category: str,
 ) -> None:
     connection.execute(
         """
-        INSERT INTO domains(category, domain, scope)
-        SELECT ?, domain, scope FROM source_domains WHERE 1
-        ON CONFLICT(category, domain) DO UPDATE
-        SET scope = MAX(scope, excluded.scope)
-        """,
-        (category,),
+        INSERT OR IGNORE INTO domains(domain)
+        SELECT domain FROM source_domains
+        """
     )
 
 
@@ -656,6 +604,7 @@ def _validate_dns_database(
     dns_config: dict[str, Any],
     *,
     progress_label: str = "",
+    progress_formatter: Callable[[float], str] | None = None,
 ) -> None:
     resolvers = dns_config.get("resolvers")
     if not isinstance(resolvers, list) or not resolvers:
@@ -922,7 +871,16 @@ def _validate_dns_database(
             removed_count += batch_removed
             kept_count = resolved_count + unknown_count
             percentage = processed_count / total_domains * 100
-            prefix = f"{progress_label} " if progress_label else ""
+            current_progress_label = (
+                progress_formatter(processed_count / total_domains)
+                if progress_formatter is not None
+                else progress_label
+            )
+            prefix = (
+                f"{current_progress_label} "
+                if current_progress_label
+                else ""
+            )
             print(
                 f"{prefix}DNS batch {batch_index}/{total_batches} complete: "
                 f"processed {processed_count:,}/{total_domains:,} "
@@ -966,27 +924,40 @@ def build(
     dns_validator: Callable[
         [sqlite3.Connection, dict[str, Any]], None
     ] | None = None,
-) -> dict[str, int]:
+) -> int:
     started_at = time.monotonic()
     sources = config.get("sources")
     dns_config = config.get("dns", {})
-    if not isinstance(sources, list) or not sources:
-        raise ValueError("sources must be a non-empty list")
-    categories: list[str] = []
-    for source in sources:
-        category = source.get("category")
-        if not isinstance(category, str) or not category:
-            raise ValueError("every source requires a category")
-        if category not in categories:
-            categories.append(category)
+    if not isinstance(sources, dict) or not sources:
+        raise ValueError("sources must be a non-empty format mapping")
+    source_configs: list[tuple[str, str, str, bool]] = []
+    for source_format, locations in sources.items():
+        if source_format not in {"adblock", "domains", "hosts", "rpz"}:
+            raise ValueError(f"Unsupported source format: {source_format}")
+        if not isinstance(locations, list):
+            raise ValueError(f"sources.{source_format} must be a list")
+        for location in locations:
+            if not isinstance(location, str) or not location:
+                raise ValueError(
+                    f"sources.{source_format} entries must be URLs or paths"
+                )
+            source_configs.append(
+                (
+                    location,
+                    location,
+                    source_format,
+                    bool(urllib.parse.urlparse(location).scheme),
+                )
+            )
+    if not source_configs:
+        raise ValueError("sources must contain at least one URL or path")
 
-    total_steps = len(sources) + 1 + len(categories)
-    dns_step = len(sources) + 1
+    total_steps = len(source_configs) + 2
+    dns_step = len(source_configs) + 1
     print(
         f"Starting build: {_quantity(total_steps, 'total step')} "
-        f"({_quantity(len(sources), 'source')}, "
-        "DNS validation, "
-        f"{_quantity(len(categories), 'category output')})",
+        f"({_quantity(len(source_configs), 'source')}, "
+        "DNS validation, 1 output)",
         flush=True,
     )
 
@@ -995,15 +966,20 @@ def build(
         with sqlite3.connect(database_path) as connection:
             _initialize_database(connection)
 
-            for source_index, source in enumerate(sources, start=1):
-                name = source.get("name", "<unnamed>")
-                category = source.get("category")
-                source_format = source.get("format", "<unknown>")
+            for source_index, source_config in enumerate(
+                source_configs,
+                start=1,
+            ):
+                name, location, source_format, is_remote = source_config
                 step_label = _step_label(source_index, total_steps)
+                description = (
+                    name if source_format == "domains"
+                    else f"{name} ({source_format})"
+                )
                 print(
-                    f"{step_label} [source {source_index}/{len(sources)}] "
-                    "Processing "
-                    f"{name} ({category}, {source_format})",
+                    f"{step_label} "
+                    f"[source {source_index}/{len(source_configs)}] "
+                    f"Processing {description}",
                     flush=True,
                 )
 
@@ -1014,36 +990,33 @@ def build(
                     source_count = _parse_source_into_database(
                         connection,
                         lines,
-                        source["format"],
-                        source.get("scope", "auto"),
+                        source_format,
                     )
 
                 try:
                     with _progress_heartbeat(
                         f"{step_label} Source {name}"
                     ):
-                        if "url" in source:
+                        if is_remote:
                             if fetch_text is None:
-                                _consume_remote(source["url"], consume)
+                                _consume_remote(location, consume)
                             else:
-                                consume(StringIO(fetch_text(source["url"])))
-                        elif "path" in source:
-                            with (base_directory / source["path"]).open(
+                                consume(StringIO(fetch_text(location)))
+                        else:
+                            with (base_directory / location).open(
                                 encoding="utf-8-sig"
                             ) as lines:
                                 consume(lines)
-                        else:
-                            raise ValueError("source requires url or path")
-                        _merge_source(connection, category)
+                        _merge_source(connection)
                         connection.commit()
                 except Exception as error:
                     raise RuntimeError(
                         f"Failed to process source {name}: {error}"
                     ) from error
                 print(
-                    f"{step_label} [source {source_index}/{len(sources)}] "
-                    "Parsed "
-                    f"{name}: {_quantity(source_count, 'domain')}",
+                    f"{step_label} "
+                    f"[source {source_index}/{len(source_configs)}] "
+                    f"Parsed {name}: {_quantity(source_count, 'domain')}",
                     flush=True,
                 )
 
@@ -1053,21 +1026,37 @@ def build(
             unique_count = connection.execute(
                 "SELECT COUNT(*) FROM (SELECT domain FROM domains GROUP BY domain)"
             ).fetchone()[0]
-            dns_step_label = _step_label(dns_step, total_steps)
+            dns_start_label = _step_label(
+                dns_step,
+                total_steps,
+                progress=0.0,
+                precision=1,
+            )
+            dns_end_label = _step_label(
+                dns_step,
+                total_steps,
+                precision=1,
+            )
             if not skip_dns:
                 print(
-                    f"{dns_step_label} DNS validation started: resolving "
+                    f"{dns_start_label} DNS validation started: resolving "
                     f"{_quantity(unique_count, 'unique domain')}",
                     flush=True,
                 )
                 with _progress_heartbeat(
-                    f"{dns_step_label} DNS validation"
+                    f"{dns_start_label} DNS validation"
                 ):
                     if dns_validator is None:
                         _validate_dns_database(
                             connection,
                             dns_config,
-                            progress_label=dns_step_label,
+                            progress_label=dns_end_label,
+                            progress_formatter=lambda fraction: _step_label(
+                                dns_step,
+                                total_steps,
+                                progress=fraction,
+                                precision=1,
+                            ),
                         )
                     else:
                         dns_validator(connection, dns_config)
@@ -1076,97 +1065,83 @@ def build(
                     "SELECT COUNT(*) FROM removed"
                 ).fetchone()[0]
                 print(
-                    f"{dns_step_label} DNS validation complete: "
+                    f"{dns_end_label} DNS validation complete: "
                     f"{_quantity(unique_count - removed_count, 'domain')} kept, "
                     f"{_quantity(removed_count, 'domain')} removed",
                     flush=True,
                 )
             else:
                 print(
-                    f"{dns_step_label} DNS validation skipped: retaining "
+                    f"{dns_end_label} DNS validation skipped: retaining "
                     f"{_quantity(unique_count, 'unique domain')}",
                     flush=True,
                 )
 
             print(
-                f"{dns_step_label} Parent-domain collapse started",
+                f"{dns_end_label} Parent-domain collapse started",
                 flush=True,
             )
             with _progress_heartbeat(
-                f"{dns_step_label} Parent-domain collapse"
+                f"{dns_end_label} Parent-domain collapse"
             ):
                 collapsed_count = _collapse_parent_domains(connection)
             print(
-                f"{dns_step_label} Parent-domain collapse complete: "
+                f"{dns_end_label} Parent-domain collapse complete: "
                 f"{_quantity(collapsed_count, 'record')} removed",
                 flush=True,
             )
 
-            output_counts: dict[str, int] = {}
-            for category in categories:
-                count = connection.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM domains AS d
-                    WHERE d.category = ?
-                      AND NOT EXISTS (
-                          SELECT 1 FROM removed AS r
-                          WHERE r.domain = d.domain
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM redundant
-                          WHERE redundant.category = d.category
-                            AND redundant.domain = d.domain
-                      )
-                    """,
-                    (category,),
-                ).fetchone()[0]
-                output_counts[category] = count
+            output_count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM domains AS d
+                WHERE NOT EXISTS (
+                      SELECT 1 FROM removed AS r
+                      WHERE r.domain = d.domain
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM redundant
+                      WHERE redundant.domain = d.domain
+                  )
+                """
+            ).fetchone()[0]
 
-            expected_outputs = {
-                f"{category}.txt" for category in categories
-            }
             output_directory.mkdir(parents=True, exist_ok=True)
-            for category_index, category in enumerate(categories, start=1):
-                output_step = dns_step + category_index
-                print(
-                    f"{_step_label(output_step, total_steps)} "
-                    f"[output {category_index}/{len(categories)}] Writing "
-                    f"{category}.txt: "
-                    f"{_quantity(output_counts[category], 'domain')}",
-                    flush=True,
-                )
-                rows = connection.execute(
-                    """
-                    SELECT d.domain
-                    FROM domains AS d
-                    WHERE d.category = ?
-                      AND NOT EXISTS (
-                          SELECT 1 FROM removed AS r
-                          WHERE r.domain = d.domain
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM redundant
-                          WHERE redundant.category = d.category
-                            AND redundant.domain = d.domain
-                      )
-                    ORDER BY d.domain
-                    """,
-                    (category,),
-                )
-                _atomic_write_domains(
-                    output_directory / f"{category}.txt",
-                    rows,
-                )
+            output_step = dns_step + 1
+            print(
+                f"{_step_label(output_step, total_steps)} "
+                "Writing blocklist.txt: "
+                f"{_quantity(output_count, 'domain')}",
+                flush=True,
+            )
+            rows = connection.execute(
+                """
+                SELECT d.domain
+                FROM domains AS d
+                WHERE NOT EXISTS (
+                      SELECT 1 FROM removed AS r
+                      WHERE r.domain = d.domain
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM redundant
+                      WHERE redundant.domain = d.domain
+                  )
+                ORDER BY d.domain
+                """
+            )
+            _atomic_write_domains(
+                output_directory / "blocklist.txt",
+                rows,
+            )
             for old_output in output_directory.glob("*.txt"):
-                if old_output.name not in expected_outputs:
+                if old_output.name != "blocklist.txt":
                     old_output.unlink()
     print(
         f"{_step_label(total_steps, total_steps)} "
         f"Build complete in {time.monotonic() - started_at:.1f}s",
         flush=True,
     )
-    return output_counts
+    return output_count
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -1184,7 +1159,7 @@ def load_config(path: Path) -> dict[str, Any]:
 
 def main() -> None:
     repository = Path(__file__).resolve().parent.parent
-    parser = argparse.ArgumentParser(description="Build domain-only blocklists")
+    parser = argparse.ArgumentParser(description="Build a domain-only blocklist")
     parser.add_argument(
         "--config",
         type=Path,
@@ -1203,14 +1178,13 @@ def main() -> None:
     args = parser.parse_args()
 
     config_path = args.config.resolve()
-    counts = build(
+    count = build(
         config=load_config(config_path),
         base_directory=config_path.parent,
         output_directory=args.output.resolve(),
         skip_dns=args.skip_dns,
     )
-    for category, count in counts.items():
-        print(f"{category}: {count} output domains")
+    print(f"blocklist: {count} output domains")
 
 
 if __name__ == "__main__":
