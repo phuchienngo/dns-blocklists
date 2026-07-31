@@ -199,13 +199,13 @@ class DnsClassificationTest(unittest.TestCase):
             self.assertEqual(counts, 3)
             log = output.getvalue()
             self.assertIn(
-                "[step 2/3 | 46.7%] DNS batch 1/3 complete: "
+                "[phase 3/4 | 54.0%] DNS batch 1/3 complete: "
                 "processed 2/5 (40.0%), resolved 1, removed 1, "
                 "pending dnsx 0",
                 log,
             )
             self.assertIn(
-                "[step 2/3 | 66.7%] DNS batch 3/3 complete: "
+                "[phase 3/4 | 90.0%] DNS batch 3/3 complete: "
                 "processed 5/5 (100.0%), resolved 3, removed 2, "
                 "pending dnsx 0",
                 log,
@@ -374,26 +374,32 @@ class DnsClassificationTest(unittest.TestCase):
             )
             calls: list[tuple[str, str, list[str]]] = []
             dnsx_commands: list[list[str]] = []
+            dnsx_batches: list[list[str]] = []
+            dnsx_stdout: list[object] = []
+            progress = StringIO()
 
             def complete_dns(command, **_kwargs) -> None:
                 if command[0] == "/dnsx":
                     dnsx_commands.append(command)
+                    dnsx_stdout.append(_kwargs.get("stdout"))
                     domains = Path(
                         command[command.index("-l") + 1]
                     ).read_text(encoding="utf-8").splitlines()
-                    self.assertEqual(
-                        domains,
-                        ["still-unknown.example", "unknown.example"],
-                    )
-                    Path(command[command.index("-o") + 1]).write_text(
-                        json.dumps(
-                            {
-                                "host": "unknown.example",
-                                "a": ["93.184.216.34"],
-                                "status_code": "NOERROR",
-                            }
+                    dnsx_batches.append(domains)
+                    output = ""
+                    if domains == ["unknown.example"]:
+                        output = (
+                            json.dumps(
+                                {
+                                    "host": "unknown.example",
+                                    "a": ["93.184.216.34"],
+                                    "status_code": "NOERROR",
+                                }
+                            )
+                            + "\n"
                         )
-                        + "\n",
+                    Path(command[command.index("-o") + 1]).write_text(
+                        output,
                         encoding="utf-8",
                     )
                     return
@@ -465,10 +471,15 @@ class DnsClassificationTest(unittest.TestCase):
                     "run",
                     side_effect=complete_dns,
                 ),
+                patch.object(builder, "DNSX_BATCH_SIZE", 1),
+                redirect_stdout(progress),
             ):
                 builder._validate_dns_database(
                     connection,
                     {"resolvers": ["1.1.1.1", "8.8.8.8"]},
+                    dnsx_progress_formatter=lambda fraction: (
+                        f"[phase 4/4 | {90 + 10 * fraction:.1f}%]"
+                    ),
                 )
                 connection.execute(
                     "CREATE TABLE removed(domain TEXT PRIMARY KEY) WITHOUT ROWID"
@@ -494,7 +505,15 @@ class DnsClassificationTest(unittest.TestCase):
                 ],
             )
 
-            self.assertEqual(len(dnsx_commands), 1)
+            self.assertEqual(
+                dnsx_batches,
+                [["still-unknown.example"], ["unknown.example"]],
+            )
+            self.assertEqual(len(dnsx_commands), 2)
+            self.assertEqual(
+                dnsx_stdout,
+                [builder.subprocess.DEVNULL, builder.subprocess.DEVNULL],
+            )
             dnsx_command = dnsx_commands[0]
             self.assertTrue(
                 {
@@ -505,6 +524,26 @@ class DnsClassificationTest(unittest.TestCase):
                     "-silent",
                     "-duc",
                 }.issubset(dnsx_command)
+            )
+            self.assertIn(
+                "[phase 4/4 | 90.0%] dnsx fallback started: "
+                "rechecking 2 domains",
+                progress.getvalue(),
+            )
+            self.assertIn(
+                "[phase 4/4 | 95.0%] dnsx batch 1/2 complete: "
+                "processed 1/2 (50.0%), recovered 0, removed 1",
+                progress.getvalue(),
+            )
+            self.assertIn(
+                "[phase 4/4 | 100.0%] dnsx batch 2/2 complete: "
+                "processed 2/2 (100.0%), recovered 1, removed 1",
+                progress.getvalue(),
+            )
+            self.assertIn(
+                "[phase 4/4 | 100.0%] dnsx fallback complete: "
+                "recovered 1, removed 1",
+                progress.getvalue(),
             )
             self.assertEqual(
                 [(call[1], call[2]) for call in calls],
@@ -659,7 +698,7 @@ class BuildTest(unittest.TestCase):
                 b"a.example\nb.example",
             )
 
-    def test_reports_heartbeat_during_dns_validation(self) -> None:
+    def test_does_not_emit_timer_heartbeat(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "custom.txt").write_text(
@@ -682,15 +721,7 @@ class BuildTest(unittest.TestCase):
                     """
                 )
 
-            with (
-                patch.object(
-                    builder,
-                    "PROGRESS_HEARTBEAT_SECONDS",
-                    0.01,
-                    create=True,
-                ),
-                redirect_stdout(output),
-            ):
+            with redirect_stdout(output):
                 build(
                     config=config,
                     base_directory=root,
@@ -698,19 +729,12 @@ class BuildTest(unittest.TestCase):
                     dns_validator=slow_validator,
                 )
 
-            self.assertIn(
-                "[step 2/3 | 33.3%] DNS validation still running (",
-                output.getvalue(),
-            )
+            self.assertNotIn("still running", output.getvalue())
 
     def test_reports_build_progress(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "custom.txt").write_text(
-                "ads.example.com\n",
-                encoding="utf-8",
-            )
-            config = {"sources": {"domains": ["custom.txt"]}}
+            config = {"sources": {"domains": ["memory://ads"]}}
             output = StringIO()
 
             with redirect_stdout(output):
@@ -719,35 +743,51 @@ class BuildTest(unittest.TestCase):
                     base_directory=root,
                     output_directory=root / "output",
                     skip_dns=True,
+                    fetch_text=lambda _: "ads.example.com\n",
                 )
 
             log = output.getvalue()
             self.assertIn(
-                "Starting build: 3 total steps "
-                "(1 source, DNS validation, 1 output)",
+                "Starting build: 4 phases "
+                "(download 0-10%, parse 10-30%, "
+                "MassDNS 30-90%, dnsx 90-100%)",
                 log,
             )
             self.assertIn(
-                "[step 1/3 | 33%] [source 1/1] "
-                "Processing custom.txt",
+                "[phase 1/4 | 0.0%] [download 1/1] "
+                "Downloading memory://ads",
                 log,
             )
             self.assertIn(
-                "[step 1/3 | 33%] [source 1/1] "
-                "Parsed custom.txt: 1 domain",
+                "[phase 1/4 | 10.0%] [download 1/1] "
+                "Downloaded memory://ads",
                 log,
             )
             self.assertIn(
-                "[step 2/3 | 66.7%] DNS validation skipped: "
+                "[phase 2/4 | 10.0%] [parse 1/1] "
+                "Parsing memory://ads",
+                log,
+            )
+            self.assertIn(
+                "[phase 2/4 | 30.0%] [parse 1/1] "
+                "Parsed memory://ads: 1 domain",
+                log,
+            )
+            self.assertIn(
+                "[phase 3/4 | 90.0%] MassDNS validation skipped: "
                 "retaining 1 unique domain",
                 log,
             )
             self.assertIn(
-                "[step 3/3 | 100%] Writing blocklist.txt: 1 domain",
+                "[phase 4/4 | 100.0%] dnsx fallback skipped",
                 log,
             )
             self.assertIn(
-                "[step 3/3 | 100%] Build complete in ",
+                "[phase 4/4 | 100.0%] Writing blocklist.txt: 1 domain",
+                log,
+            )
+            self.assertIn(
+                "[phase 4/4 | 100.0%] Build complete in ",
                 log,
             )
 

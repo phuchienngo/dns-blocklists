@@ -10,13 +10,11 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
-import threading
 import time
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable
-from contextlib import contextmanager
-from io import StringIO, TextIOWrapper
+from io import StringIO
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -32,10 +30,11 @@ DOMAIN_PATTERN = re.compile(
     r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
 )
-PROGRESS_HEARTBEAT_SECONDS = 30
 DNS_BATCH_SIZE = 10_000
+DNSX_BATCH_SIZE = 2_000
 DNS_PRIMARY_HASHMAP_SIZE = 800
 DNS_RETRY_HASHMAP_SIZE = 200
+PROGRESS_PHASE_RANGES = ((0, 10), (10, 30), (30, 90), (90, 100))
 DomainEmitter = Callable[[str], None]
 
 
@@ -46,40 +45,14 @@ def _quantity(count: int, noun: str) -> str:
     return f"{count:,} {plural}"
 
 
-def _step_label(
-    step: int,
-    total_steps: int,
+def _phase_label(
+    phase: int,
     *,
     progress: float = 1.0,
-    precision: int = 0,
 ) -> str:
-    percentage = (step - 1 + progress) / total_steps * 100
-    return (
-        f"[step {step}/{total_steps} | "
-        f"{percentage:.{precision}f}%]"
-    )
-
-
-@contextmanager
-def _progress_heartbeat(label: str):
-    started_at = time.monotonic()
-    stopped = threading.Event()
-
-    def report() -> None:
-        while not stopped.wait(PROGRESS_HEARTBEAT_SECONDS):
-            elapsed = time.monotonic() - started_at
-            print(
-                f"{label} still running ({elapsed:.0f}s elapsed)",
-                flush=True,
-            )
-
-    reporter = threading.Thread(target=report, daemon=True)
-    reporter.start()
-    try:
-        yield
-    finally:
-        stopped.set()
-        reporter.join()
+    start, end = PROGRESS_PHASE_RANGES[phase - 1]
+    percentage = start + (end - start) * progress
+    return f"[phase {phase}/4 | {percentage:.1f}%]"
 
 
 def normalize_domain(value: str) -> str | None:
@@ -571,9 +544,9 @@ def _collapse_parent_domains(
     return connection.total_changes - changes_before
 
 
-def _consume_remote(
+def _download_remote(
     url: str,
-    consume: Callable[[TextIO], None],
+    destination: Path,
 ) -> None:
     request = urllib.request.Request(
         url,
@@ -583,8 +556,8 @@ def _consume_remote(
     for attempt in range(3):
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
-                with TextIOWrapper(response, encoding="utf-8-sig") as lines:
-                    consume(lines)
+                with destination.open("wb") as output:
+                    shutil.copyfileobj(response, output)
             return
         except Exception as error:
             last_error = error
@@ -667,8 +640,8 @@ def _validate_dns_database(
     connection: sqlite3.Connection,
     dns_config: dict[str, Any],
     *,
-    progress_label: str = "",
     progress_formatter: Callable[[float], str] | None = None,
+    dnsx_progress_formatter: Callable[[float], str] | None = None,
 ) -> None:
     resolvers = dns_config.get("resolvers")
     if not isinstance(resolvers, list) or not resolvers:
@@ -940,7 +913,7 @@ def _validate_dns_database(
             current_progress_label = (
                 progress_formatter(processed_count / total_domains)
                 if progress_formatter is not None
-                else progress_label
+                else ""
             )
             prefix = (
                 f"{current_progress_label} "
@@ -961,64 +934,109 @@ def _validate_dns_database(
             "SELECT COUNT(*) FROM dns_unknown"
         ).fetchone()[0]
         if pending_count:
-            write_input(
-                connection.execute(
-                    "SELECT domain FROM dns_unknown ORDER BY domain"
-                )
-            )
             dnsx_output_path = temporary / "dnsx.jsonl"
             dnsx_error_path = temporary / "dnsx.err"
-            dnsx_output_path.touch()
+            dnsx_start_label = (
+                dnsx_progress_formatter(0.0)
+                if dnsx_progress_formatter is not None
+                else ""
+            )
             print(
-                f"{progress_label + ' ' if progress_label else ''}"
+                f"{dnsx_start_label + ' ' if dnsx_start_label else ''}"
                 f"dnsx fallback started: rechecking "
                 f"{_quantity(pending_count, 'domain')}",
                 flush=True,
             )
-            command = [
-                dnsx_executable,
-                "-l",
-                str(input_path),
-                "-a",
-                "-aaaa",
-                "-json",
-                "-omit-raw",
-                "-silent",
-                "-retry",
-                "3",
-                "-r",
-                str(resolver_path),
-                "-duc",
-                "-o",
-                str(dnsx_output_path),
-            ]
-            fallback_label = (
-                f"{progress_label} dnsx fallback"
-                if progress_label
-                else "dnsx fallback"
+            total_dnsx_batches = (
+                pending_count + DNSX_BATCH_SIZE - 1
+            ) // DNSX_BATCH_SIZE
+            dnsx_cursor = connection.execute(
+                "SELECT domain FROM dns_unknown ORDER BY domain"
             )
-            with (
-                dnsx_error_path.open("w", encoding="utf-8") as errors,
-                _progress_heartbeat(fallback_label),
-            ):
-                try:
-                    subprocess.run(
-                        command,
-                        stderr=errors,
-                        check=True,
-                        timeout=command_timeout,
+            dnsx_processed = 0
+            recovered_count = 0
+            dnsx_batch_index = 0
+            while dnsx_batch := dnsx_cursor.fetchmany(DNSX_BATCH_SIZE):
+                dnsx_batch_index += 1
+                write_input(dnsx_batch)
+                dnsx_output_path.write_text("", encoding="utf-8")
+                command = [
+                    dnsx_executable,
+                    "-l",
+                    str(input_path),
+                    "-a",
+                    "-aaaa",
+                    "-json",
+                    "-omit-raw",
+                    "-silent",
+                    "-retry",
+                    "3",
+                    "-r",
+                    str(resolver_path),
+                    "-duc",
+                    "-o",
+                    str(dnsx_output_path),
+                ]
+                with dnsx_error_path.open("w", encoding="utf-8") as errors:
+                    try:
+                        subprocess.run(
+                            command,
+                            stdout=subprocess.DEVNULL,
+                            stderr=errors,
+                            check=True,
+                            timeout=command_timeout,
+                        )
+                    except (
+                        subprocess.CalledProcessError,
+                        subprocess.TimeoutExpired,
+                    ) as error:
+                        raise RuntimeError(
+                            f"dnsx failed on batch {dnsx_batch_index}/"
+                            f"{total_dnsx_batches}"
+                        ) from error
+                with dnsx_output_path.open(encoding="utf-8") as output:
+                    recovered_count += _store_dnsx_results(
+                        connection,
+                        output,
                     )
-                except (
-                    subprocess.CalledProcessError,
-                    subprocess.TimeoutExpired,
-                ) as error:
-                    raise RuntimeError("dnsx fallback failed") from error
-            with dnsx_output_path.open(encoding="utf-8") as output:
-                recovered_count = _store_dnsx_results(connection, output)
+                dnsx_processed += len(dnsx_batch)
+                dnsx_progress_label = (
+                    dnsx_progress_formatter(
+                        dnsx_processed / pending_count
+                    )
+                    if dnsx_progress_formatter is not None
+                    else ""
+                )
+                print(
+                    f"{dnsx_progress_label + ' ' if dnsx_progress_label else ''}"
+                    f"dnsx batch {dnsx_batch_index}/"
+                    f"{total_dnsx_batches} complete: processed "
+                    f"{dnsx_processed:,}/{pending_count:,} "
+                    f"({dnsx_processed / pending_count * 100:.1f}%), "
+                    f"recovered {recovered_count:,}, removed "
+                    f"{dnsx_processed - recovered_count:,}",
+                    flush=True,
+                )
+            dnsx_end_label = (
+                dnsx_progress_formatter(1.0)
+                if dnsx_progress_formatter is not None
+                else ""
+            )
             print(
-                f"{progress_label + ' ' if progress_label else ''}"
+                f"{dnsx_end_label + ' ' if dnsx_end_label else ''}"
                 f"dnsx fallback complete: recovered {recovered_count:,}, "
                 f"removed {pending_count - recovered_count:,}",
+                flush=True,
+            )
+        else:
+            dnsx_end_label = (
+                dnsx_progress_formatter(1.0)
+                if dnsx_progress_formatter is not None
+                else ""
+            )
+            print(
+                f"{dnsx_end_label + ' ' if dnsx_end_label else ''}"
+                "dnsx fallback skipped: no unknown domains",
                 flush=True,
             )
 
@@ -1084,70 +1102,114 @@ def build(
     if not source_configs:
         raise ValueError("sources must contain at least one URL or path")
 
-    total_steps = len(source_configs) + 2
-    dns_step = len(source_configs) + 1
     print(
-        f"Starting build: {_quantity(total_steps, 'total step')} "
-        f"({_quantity(len(source_configs), 'source')}, "
-        "DNS validation, 1 output)",
+        "Starting build: 4 phases "
+        "(download 0-10%, parse 10-30%, "
+        "MassDNS 30-90%, dnsx 90-100%)",
         flush=True,
     )
 
     with tempfile.TemporaryDirectory(prefix="dns-blocklists-db-") as directory:
-        database_path = Path(directory) / "build.sqlite3"
+        temporary = Path(directory)
+        database_path = temporary / "build.sqlite3"
+        download_directory = temporary / "downloads"
+        download_directory.mkdir()
+        source_materials: list[tuple[str, str, Path]] = []
+
+        for source_index, source_config in enumerate(
+            source_configs,
+            start=1,
+        ):
+            name, location, source_format, is_remote = source_config
+            start_label = _phase_label(
+                1,
+                progress=(source_index - 1) / len(source_configs),
+            )
+            end_label = _phase_label(
+                1,
+                progress=source_index / len(source_configs),
+            )
+            if is_remote:
+                source_path = download_directory / f"{source_index}.txt"
+                print(
+                    f"{start_label} "
+                    f"[download {source_index}/{len(source_configs)}] "
+                    f"Downloading {name}",
+                    flush=True,
+                )
+                try:
+                    if fetch_text is None:
+                        _download_remote(location, source_path)
+                    else:
+                        source_path.write_text(
+                            fetch_text(location),
+                            encoding="utf-8",
+                        )
+                except Exception as error:
+                    raise RuntimeError(
+                        f"Failed to download source {name}: {error}"
+                    ) from error
+                print(
+                    f"{end_label} "
+                    f"[download {source_index}/{len(source_configs)}] "
+                    f"Downloaded {name}",
+                    flush=True,
+                )
+            else:
+                source_path = base_directory / location
+                if not source_path.is_file():
+                    raise RuntimeError(f"Source file not found: {name}")
+                print(
+                    f"{end_label} "
+                    f"[download {source_index}/{len(source_configs)}] "
+                    f"Local source ready: {name}",
+                    flush=True,
+                )
+            source_materials.append((name, source_format, source_path))
+
         with sqlite3.connect(database_path) as connection:
             _initialize_database(connection)
 
-            for source_index, source_config in enumerate(
-                source_configs,
+            for source_index, source_material in enumerate(
+                source_materials,
                 start=1,
             ):
-                name, location, source_format, is_remote = source_config
-                step_label = _step_label(source_index, total_steps)
+                name, source_format, source_path = source_material
+                start_label = _phase_label(
+                    2,
+                    progress=(source_index - 1) / len(source_materials),
+                )
+                end_label = _phase_label(
+                    2,
+                    progress=source_index / len(source_materials),
+                )
                 description = (
                     name if source_format == "domains"
                     else f"{name} ({source_format})"
                 )
                 print(
-                    f"{step_label} "
-                    f"[source {source_index}/{len(source_configs)}] "
-                    f"Processing {description}",
+                    f"{start_label} "
+                    f"[parse {source_index}/{len(source_materials)}] "
+                    f"Parsing {description}",
                     flush=True,
                 )
 
-                source_count = 0
-
-                def consume(lines: TextIO) -> None:
-                    nonlocal source_count
-                    source_count = _parse_source_into_database(
-                        connection,
-                        lines,
-                        source_format,
-                    )
-
                 try:
-                    with _progress_heartbeat(
-                        f"{step_label} Source {name}"
-                    ):
-                        if is_remote:
-                            if fetch_text is None:
-                                _consume_remote(location, consume)
-                            else:
-                                consume(StringIO(fetch_text(location)))
-                        else:
-                            with (base_directory / location).open(
-                                encoding="utf-8-sig"
-                            ) as lines:
-                                consume(lines)
-                        _merge_source(connection)
-                        connection.commit()
+                    with source_path.open(encoding="utf-8-sig") as lines:
+                        source_count = _parse_source_into_database(
+                            connection,
+                            lines,
+                            source_format,
+                        )
+                    _merge_source(connection)
+                    connection.commit()
                 except Exception as error:
                     raise RuntimeError(
-                        f"Failed to process source {name}: {error}"
+                        f"Failed to parse source {name}: {error}"
                     ) from error
                 print(
-                    f"{step_label} "
-                    f"[source {source_index}/{len(source_configs)}] "
+                    f"{end_label} "
+                    f"[parse {source_index}/{len(source_materials)}] "
                     f"Parsed {name}: {_quantity(source_count, 'domain')}",
                     flush=True,
                 )
@@ -1158,67 +1220,60 @@ def build(
             unique_count = connection.execute(
                 "SELECT COUNT(*) FROM (SELECT domain FROM domains GROUP BY domain)"
             ).fetchone()[0]
-            dns_start_label = _step_label(
-                dns_step,
-                total_steps,
-                progress=0.0,
-                precision=1,
-            )
-            dns_end_label = _step_label(
-                dns_step,
-                total_steps,
-                precision=1,
-            )
+            massdns_start_label = _phase_label(3, progress=0.0)
+            massdns_end_label = _phase_label(3)
+            dnsx_end_label = _phase_label(4)
             if not skip_dns:
                 print(
-                    f"{dns_start_label} DNS validation started: resolving "
+                    f"{massdns_start_label} MassDNS validation started: "
+                    "resolving "
                     f"{_quantity(unique_count, 'unique domain')}",
                     flush=True,
                 )
-                with _progress_heartbeat(
-                    f"{dns_start_label} DNS validation"
-                ):
-                    if dns_validator is None:
-                        _validate_dns_database(
-                            connection,
-                            dns_config,
-                            progress_label=dns_end_label,
-                            progress_formatter=lambda fraction: _step_label(
-                                dns_step,
-                                total_steps,
-                                progress=fraction,
-                                precision=1,
-                            ),
-                        )
-                    else:
-                        dns_validator(connection, dns_config)
-                    _remove_unresolved_domains(connection)
+                if dns_validator is None:
+                    _validate_dns_database(
+                        connection,
+                        dns_config,
+                        progress_formatter=lambda fraction: _phase_label(
+                            3,
+                            progress=fraction,
+                        ),
+                        dnsx_progress_formatter=lambda fraction: _phase_label(
+                            4,
+                            progress=fraction,
+                        ),
+                    )
+                else:
+                    dns_validator(connection, dns_config)
+                _remove_unresolved_domains(connection)
                 removed_count = connection.execute(
                     "SELECT COUNT(*) FROM removed"
                 ).fetchone()[0]
                 print(
-                    f"{dns_end_label} DNS validation complete: "
+                    f"{dnsx_end_label} DNS validation complete: "
                     f"{_quantity(unique_count - removed_count, 'domain')} kept, "
                     f"{_quantity(removed_count, 'domain')} removed",
                     flush=True,
                 )
             else:
                 print(
-                    f"{dns_end_label} DNS validation skipped: retaining "
+                    f"{massdns_end_label} MassDNS validation skipped: "
+                    "retaining "
                     f"{_quantity(unique_count, 'unique domain')}",
+                    flush=True,
+                )
+                print(
+                    f"{dnsx_end_label} dnsx fallback skipped",
                     flush=True,
                 )
 
             print(
-                f"{dns_end_label} Parent-domain collapse started",
+                f"{dnsx_end_label} Parent-domain collapse started",
                 flush=True,
             )
-            with _progress_heartbeat(
-                f"{dns_end_label} Parent-domain collapse"
-            ):
-                collapsed_count = _collapse_parent_domains(connection)
+            collapsed_count = _collapse_parent_domains(connection)
             print(
-                f"{dns_end_label} Parent-domain collapse complete: "
+                f"{dnsx_end_label} Parent-domain collapse complete: "
                 f"{_quantity(collapsed_count, 'record')} removed",
                 flush=True,
             )
@@ -1239,9 +1294,8 @@ def build(
             ).fetchone()[0]
 
             output_directory.mkdir(parents=True, exist_ok=True)
-            output_step = dns_step + 1
             print(
-                f"{_step_label(output_step, total_steps)} "
+                f"{dnsx_end_label} "
                 "Writing blocklist.txt: "
                 f"{_quantity(output_count, 'domain')}",
                 flush=True,
@@ -1269,7 +1323,7 @@ def build(
                 if old_output.name != "blocklist.txt":
                     old_output.unlink()
     print(
-        f"{_step_label(total_steps, total_steps)} "
+        f"{_phase_label(4)} "
         f"Build complete in {time.monotonic() - started_at:.1f}s",
         flush=True,
     )

@@ -31,12 +31,12 @@ and `rpz`; empty groups may be omitted.
 
 There are no categories or configured minimum and maximum list sizes.
 
-Large inputs are processed as streams. Parsed domains, Adblock candidates,
-deduplication indexes, and resolved-domain markers are kept in temporary SQLite
-databases on disk; the sorted TXT output is written row by row. RAM usage
-therefore does not grow with the total number of input domains, but the system
-temporary directory must have enough free disk space for the build database and
-MassDNS JSONL output.
+Remote inputs are downloaded to temporary files and then parsed as streams.
+Parsed domains, Adblock candidates, deduplication indexes, and resolved-domain
+markers are kept in temporary SQLite databases on disk; the sorted TXT output
+is written row by row. RAM usage therefore does not grow with the total number
+of input domains, but the system temporary directory must have enough free disk
+space for downloaded sources, the build database, and DNS JSONL output.
 
 Adblock syntax is parsed with `python-abp`; only blocking URL patterns that can
 be converted safely to domains are kept. Exception, cosmetic, regular
@@ -47,19 +47,17 @@ blocked domains.
 The build fails instead of publishing partial output when a source is
 unavailable or MassDNS itself cannot complete.
 
-The build logs each source as it is processed, the DNS validation totals, each
-output as it is written, and the total elapsed time. Source processing and DNS
-validation emit a heartbeat every 30 seconds so a slow or stuck phase remains
-visible in CI logs. Every phase also includes its overall step and percentage;
-the total consists of all sources, DNS validation, and all output files. During
-DNS validation, each completed batch advances that overall percentage instead
-of leaving it fixed for the entire DNS step.
+The build logs real completed work without timer heartbeats. Overall progress is
+split into download (0-10%), parse and merge (10-30%), MassDNS (30-90%), and
+dnsx fallback (90-100%). Download and parse advance after each source; MassDNS
+and dnsx advance after each completed batch. dnsx reports recovered and removed
+counts, or reports that it was skipped when MassDNS produced no unknown domains.
 
 MassDNS validation runs in batches of 10,000 domains. After every batch, the
 log reports cumulative processed, resolved, removed, and dnsx-pending counts.
-The dnsx fallback logs its start, completion, recovered count, and final removed
-count. This provides exact progress without loading the full domain list into
-RAM.
+The dnsx fallback processes batches of 2,000 and logs cumulative processed,
+recovered, and removed counts. This provides exact progress without loading the
+full domain list into RAM.
 
 Before writing the output, descendants are collapsed when a retained parent
 domain already exists. For example, `a.example.com` and `b.a.example.com` are
