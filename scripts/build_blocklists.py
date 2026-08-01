@@ -25,6 +25,7 @@ import dns.tokenizer
 import dns.transaction
 import dns.zonefile
 from abp.filters import FilterAction, SelectorType, parse_filterlist
+from publicsuffix2 import PublicSuffixList
 
 DOMAIN_PATTERN = re.compile(
     r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
@@ -581,7 +582,83 @@ def _collapse_parent_domains(
         )
         """
     )
+    collapsed_count = connection.total_changes - changes_before
+    connection.execute(
+        """
+        DELETE FROM domains
+        WHERE EXISTS (
+            SELECT 1
+            FROM redundant
+            WHERE redundant.domain = domains.domain
+        )
+        """
+    )
+    connection.execute("DELETE FROM redundant")
+    return collapsed_count
+
+
+def _exclude_allowlisted_domains(
+    connection: sqlite3.Connection,
+) -> int:
+    changes_before = connection.total_changes
+    connection.execute(
+        """
+        DELETE FROM domains
+        WHERE EXISTS (
+            SELECT 1
+            FROM allowlist_domains AS allowed
+            WHERE domains.domain = allowed.domain
+               OR domains.domain LIKE '%.' || allowed.domain
+        )
+        """
+    )
     return connection.total_changes - changes_before
+
+
+def _exclude_public_suffixes(
+    connection: sqlite3.Connection,
+    public_suffix_path: Path,
+) -> int:
+    with public_suffix_path.open(encoding="utf-8") as suffix_lines:
+        public_suffixes = PublicSuffixList(suffix_lines, idna=True)
+
+    connection.execute(
+        """
+        CREATE TEMP TABLE excluded_public_suffixes (
+            domain TEXT PRIMARY KEY
+        ) WITHOUT ROWID
+        """
+    )
+    excluded: list[tuple[str]] = []
+    for (domain,) in connection.execute("SELECT domain FROM domains"):
+        if public_suffixes.get_tld(domain, strict=True) == domain:
+            excluded.append((domain,))
+        if len(excluded) >= 5000:
+            connection.executemany(
+                "INSERT OR IGNORE INTO excluded_public_suffixes VALUES (?)",
+                excluded,
+            )
+            excluded.clear()
+    if excluded:
+        connection.executemany(
+            "INSERT OR IGNORE INTO excluded_public_suffixes VALUES (?)",
+            excluded,
+        )
+    excluded_count = connection.execute(
+        "SELECT COUNT(*) FROM excluded_public_suffixes"
+    ).fetchone()[0]
+    connection.execute(
+        """
+        DELETE FROM domains
+        WHERE EXISTS (
+            SELECT 1
+            FROM excluded_public_suffixes AS suffix
+            WHERE suffix.domain = domains.domain
+        )
+        """
+    )
+    connection.execute("DROP TABLE excluded_public_suffixes")
+    return excluded_count
 
 
 def _download_remote(
@@ -641,6 +718,9 @@ def _initialize_database(connection: sqlite3.Connection) -> None:
         CREATE TABLE domains (
             domain TEXT PRIMARY KEY
         ) WITHOUT ROWID;
+        CREATE TABLE allowlist_domains (
+            domain TEXT PRIMARY KEY
+        ) WITHOUT ROWID;
         CREATE TABLE dns_unknown (
             domain TEXT PRIMARY KEY
         ) WITHOUT ROWID;
@@ -674,6 +754,17 @@ def _merge_source(
     connection.execute(
         """
         INSERT OR IGNORE INTO domains(domain)
+        SELECT domain FROM source_domains
+        """
+    )
+
+
+def _merge_allowlist(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO allowlist_domains(domain)
         SELECT domain FROM source_domains
         """
     )
@@ -1129,7 +1220,7 @@ def build(
     dns_config = config.get("dns", {})
     if not isinstance(sources, dict) or not sources:
         raise ValueError("sources must be a non-empty format mapping")
-    source_configs: list[tuple[str, str, str, bool]] = []
+    source_configs: list[tuple[str, str, str, bool, str]] = []
     for source_format, locations in sources.items():
         if source_format not in {"adblock", "domains", "hosts", "rpz"}:
             raise ValueError(f"Unsupported source format: {source_format}")
@@ -1146,10 +1237,46 @@ def build(
                     location,
                     source_format,
                     bool(urllib.parse.urlparse(location).scheme),
+                    "blocklist",
                 )
             )
     if not source_configs:
         raise ValueError("sources must contain at least one URL or path")
+
+    allowlist = config.get("allowlist", [])
+    if not isinstance(allowlist, list):
+        raise ValueError("allowlist must be a list")
+    for location in allowlist:
+        if not isinstance(location, str) or not location:
+            raise ValueError("allowlist entries must be URLs or paths")
+        source_configs.append(
+            (
+                location,
+                location,
+                "domains",
+                bool(urllib.parse.urlparse(location).scheme),
+                "allowlist",
+            )
+        )
+
+    public_suffix_location = config.get("public_suffix_list")
+    if public_suffix_location is not None:
+        if (
+            not isinstance(public_suffix_location, str)
+            or not public_suffix_location
+        ):
+            raise ValueError("public_suffix_list must be a URL or path")
+        source_configs.append(
+            (
+                public_suffix_location,
+                public_suffix_location,
+                "psl",
+                bool(
+                    urllib.parse.urlparse(public_suffix_location).scheme
+                ),
+                "public_suffix_list",
+            )
+        )
 
     print(
         "Starting build: 4 phases "
@@ -1163,13 +1290,13 @@ def build(
         database_path = temporary / "build.sqlite3"
         download_directory = temporary / "downloads"
         download_directory.mkdir()
-        source_materials: list[tuple[str, str, Path]] = []
+        source_materials: list[tuple[str, str, Path, str]] = []
 
         for source_index, source_config in enumerate(
             source_configs,
             start=1,
         ):
-            name, location, source_format, is_remote = source_config
+            name, location, source_format, is_remote, role = source_config
             start_label = _phase_label(
                 1,
                 progress=(source_index - 1) / len(source_configs),
@@ -1214,16 +1341,19 @@ def build(
                     f"Local source ready: {name}",
                     flush=True,
                 )
-            source_materials.append((name, source_format, source_path))
+            source_materials.append(
+                (name, source_format, source_path, role)
+            )
 
         with sqlite3.connect(database_path) as connection:
             _initialize_database(connection)
+            public_suffix_path: Path | None = None
 
             for source_index, source_material in enumerate(
                 source_materials,
                 start=1,
             ):
-                name, source_format, source_path = source_material
+                name, source_format, source_path, role = source_material
                 start_label = _phase_label(
                     2,
                     progress=(source_index - 1) / len(source_materials),
@@ -1232,10 +1362,15 @@ def build(
                     2,
                     progress=source_index / len(source_materials),
                 )
-                description = (
-                    name if source_format == "domains"
-                    else f"{name} ({source_format})"
-                )
+                if role == "allowlist":
+                    description = f"{name} (allowlist)"
+                elif role == "public_suffix_list":
+                    description = f"{name} (public suffix list)"
+                else:
+                    description = (
+                        name if source_format == "domains"
+                        else f"{name} ({source_format})"
+                    )
                 print(
                     f"{start_label} "
                     f"[parse {source_index}/{len(source_materials)}] "
@@ -1244,28 +1379,69 @@ def build(
                 )
 
                 try:
-                    with source_path.open(encoding="utf-8-sig") as lines:
-                        source_count = _parse_source_into_database(
-                            connection,
-                            lines,
-                            source_format,
-                        )
-                    _merge_source(connection)
+                    if role == "public_suffix_list":
+                        public_suffix_path = source_path
+                        source_count = 0
+                    else:
+                        with source_path.open(encoding="utf-8-sig") as lines:
+                            source_count = _parse_source_into_database(
+                                connection,
+                                lines,
+                                source_format,
+                            )
+                        if role == "allowlist":
+                            _merge_allowlist(connection)
+                        else:
+                            _merge_source(connection)
                     connection.commit()
                 except Exception as error:
                     raise RuntimeError(
                         f"Failed to parse source {name}: {error}"
                     ) from error
+                result = (
+                    "public suffix data ready"
+                    if role == "public_suffix_list"
+                    else _quantity(source_count, "domain")
+                )
                 print(
                     f"{end_label} "
                     f"[parse {source_index}/{len(source_materials)}] "
-                    f"Parsed {name}: {_quantity(source_count, 'domain')}",
+                    f"Parsed {name}: {result}",
                     flush=True,
                 )
 
             connection.execute(
                 "CREATE TABLE removed(domain TEXT PRIMARY KEY) WITHOUT ROWID"
             )
+            allowlisted_count = _exclude_allowlisted_domains(connection)
+            if allowlist:
+                print(
+                    f"{_phase_label(2)} Allowlist applied: "
+                    f"{_quantity(allowlisted_count, 'domain')} excluded",
+                    flush=True,
+                )
+            if public_suffix_path is not None:
+                public_suffix_count = _exclude_public_suffixes(
+                    connection,
+                    public_suffix_path,
+                )
+                print(
+                    f"{_phase_label(2)} Public suffix filter applied: "
+                    f"{_quantity(public_suffix_count, 'domain')} excluded",
+                    flush=True,
+                )
+
+            print(
+                f"{_phase_label(2)} Parent-domain collapse started",
+                flush=True,
+            )
+            collapsed_count = _collapse_parent_domains(connection)
+            print(
+                f"{_phase_label(2)} Parent-domain collapse complete: "
+                f"{_quantity(collapsed_count, 'record')} removed",
+                flush=True,
+            )
+
             unique_count = connection.execute(
                 "SELECT COUNT(*) FROM (SELECT domain FROM domains GROUP BY domain)"
             ).fetchone()[0]
@@ -1315,17 +1491,6 @@ def build(
                     f"{dnsx_end_label} dnsx fallback skipped",
                     flush=True,
                 )
-
-            print(
-                f"{dnsx_end_label} Parent-domain collapse started",
-                flush=True,
-            )
-            collapsed_count = _collapse_parent_domains(connection)
-            print(
-                f"{dnsx_end_label} Parent-domain collapse complete: "
-                f"{_quantity(collapsed_count, 'record')} removed",
-                flush=True,
-            )
 
             output_count = connection.execute(
                 """

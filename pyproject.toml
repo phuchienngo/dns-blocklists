@@ -5,6 +5,7 @@ description = "Build a domain-only DNS blocklist"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "dnspython==2.8.0",
+    "publicsuffix2==2.20191221",
     "python-abp==0.2.0",
     "pyyaml==6.0.3",
 ]

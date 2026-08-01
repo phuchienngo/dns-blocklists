@@ -3,17 +3,19 @@ dns:
     - 1.0.0.1
     - 1.1.1.1
 
+public_suffix_list: https://raw.githubusercontent.com/publicsuffix/list/refs/heads/main/public_suffix_list.dat
+
+allowlist:
+  - custom/allowlist.txt
+
 sources:
-  rpz:
-    - https://small.oisd.nl/rpz
-
-  hosts:
-    - https://raw.githubusercontent.com/lassekongo83/Frellwits-filter-lists/master/Frellwits-Swedish-Hosts-File.txt
-
   adblock:
     - https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt
     - https://easylist.to/easylist/easyprivacy.txt
-
+  hosts:
+    - https://raw.githubusercontent.com/bigdargon/hostsVN/master/hosts
+    - https://raw.githubusercontent.com/bigdargon/hostsVN/master/extensions/gambling/hosts
+    - https://raw.githubusercontent.com/bigdargon/hostsVN/master/extensions/threat/hosts
   domains:
     - https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/popupads-onlydomains.txt
     - https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.amazon-onlydomains.txt

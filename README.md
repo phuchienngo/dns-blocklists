@@ -25,9 +25,14 @@ To rebuild sources without performing or updating DNS validation:
 uv run --locked python scripts/build_blocklists.py --skip-dns
 ```
 
-Inputs are grouped by format in `sources.yaml`. Each group contains URLs or
-repository-relative paths. Supported groups are `domains`, `hosts`, `adblock`,
-and `rpz`; empty groups may be omitted.
+Blocklist inputs are grouped by format under `sources` in `sources.yaml`. Each
+group contains URLs or repository-relative paths. Supported groups are
+`domains`, `hosts`, `adblock`, and `rpz`; empty groups may be omitted.
+
+`allowlist` contains domain-list URLs or paths whose entries must not appear in
+the output. An allowlisted domain also excludes all of its subdomains; it does
+not create a separate output list. `public_suffix_list` points to the current
+[Public Suffix List](https://publicsuffix.org/list/public_suffix_list.dat).
 
 There are no categories or configured minimum and maximum list sizes.
 
@@ -44,8 +49,8 @@ expression, and disabled (`badfilter`) rules are ignored. RPZ zone syntax is
 parsed with `dnspython`; only owners redirected by `CNAME .` are treated as
 blocked domains.
 
-The build fails instead of publishing partial output when a source is
-unavailable or either DNS validator cannot complete.
+The build fails instead of publishing partial output when a blocklist,
+allowlist, the Public Suffix List, or either DNS validator cannot complete.
 
 The build logs real completed work without timer heartbeats. Overall progress is
 split into download (0-10%), parse and merge (10-30%), MassDNS (30-90%), and
@@ -60,10 +65,16 @@ The dnsx fallback processes batches of 2,000 and logs cumulative processed,
 recovered, explicitly removed, and still-unknown counts. This provides exact
 progress without loading the full domain list into RAM.
 
-Before writing the output, descendants are collapsed when a retained parent
-domain already exists. For example, `a.example.com` and `b.a.example.com` are
-omitted when `example.com` is present. A parent removed by DNS validation does
-not suppress its children.
+Before DNS validation, exact public suffixes are removed using the downloaded
+ICANN and private sections of the Public Suffix List. This prevents entries such
+as `duckdns.org` from blocking every registrant below that shared suffix. A real
+domain below the suffix, such as `tracker.duckdns.org`, remains eligible.
+
+Parent-domain collapse also runs before DNS validation. For example,
+`a.example.com` and `b.a.example.com` are omitted when `example.com` is present,
+so DNS only validates the parent. This reduces DNS work and output records, with
+the deliberate trade-off that the children are not restored if the parent later
+fails DNS validation.
 
 ## DNS validation
 

@@ -636,6 +636,107 @@ class DnsClassificationTest(unittest.TestCase):
             )
 
 class BuildTest(unittest.TestCase):
+    def test_filters_exact_public_suffixes_before_parent_collapse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "domains.txt").write_text(
+                "duckdns.org\ntracker.duckdns.org\nexample.com\n",
+                encoding="utf-8",
+            )
+
+            count = build(
+                config={
+                    "public_suffix_list": "memory://psl",
+                    "sources": {"domains": ["domains.txt"]},
+                },
+                base_directory=root,
+                output_directory=root / "output",
+                skip_dns=True,
+                fetch_text=lambda _: (
+                    "// ===BEGIN ICANN DOMAINS===\ncom\norg\n"
+                    "// ===BEGIN PRIVATE DOMAINS===\nduckdns.org\n"
+                ),
+            )
+
+            self.assertEqual(count, 2)
+            self.assertEqual(
+                (root / "output/blocklist.txt").read_text(encoding="utf-8"),
+                "example.com\ntracker.duckdns.org",
+            )
+
+    def test_allowlist_excludes_domains_and_their_descendants(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "domains.txt").write_text(
+                "allowed.example.com\nsub.allowed.example.com\nads.example.com\n",
+                encoding="utf-8",
+            )
+            (root / "allowlist.txt").write_text(
+                "allowed.example.com\n",
+                encoding="utf-8",
+            )
+
+            count = build(
+                config={
+                    "sources": {"domains": ["domains.txt"]},
+                    "allowlist": ["allowlist.txt"],
+                },
+                base_directory=root,
+                output_directory=root / "output",
+                skip_dns=True,
+            )
+
+            self.assertEqual(count, 1)
+            self.assertEqual(
+                (root / "output/blocklist.txt").read_text(encoding="utf-8"),
+                "ads.example.com",
+            )
+            self.assertEqual(
+                sorted(path.name for path in (root / "output").iterdir()),
+                ["blocklist.txt"],
+            )
+
+    def test_collapses_descendants_before_dns_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "domains.txt").write_text(
+                "dead-parent.example\nlive.dead-parent.example\n",
+                encoding="utf-8",
+            )
+            validated: list[str] = []
+
+            def validate(
+                connection: sqlite3.Connection,
+                _dns_config: dict,
+            ) -> None:
+                validated.extend(
+                    domain
+                    for (domain,) in connection.execute(
+                        "SELECT domain FROM domains ORDER BY domain"
+                    )
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE dns_resolved (
+                        domain TEXT PRIMARY KEY
+                    ) WITHOUT ROWID
+                    """
+                )
+
+            count = build(
+                config={"sources": {"domains": ["domains.txt"]}},
+                base_directory=root,
+                output_directory=root / "output",
+                dns_validator=validate,
+            )
+
+            self.assertEqual(validated, ["dead-parent.example"])
+            self.assertEqual(count, 0)
+            self.assertEqual(
+                (root / "output/blocklist.txt").read_text(encoding="utf-8"),
+                "",
+            )
+
     def test_accepts_sources_grouped_by_format(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -710,10 +811,10 @@ class BuildTest(unittest.TestCase):
                 dns_validator=validate,
             )
 
-            self.assertEqual(counts, 2)
+            self.assertEqual(counts, 1)
             self.assertEqual(
                 (root / "output/blocklist.txt").read_text(encoding="utf-8"),
-                "example.com\nlive.dead-parent.com",
+                "example.com",
             )
 
     def test_output_has_no_trailing_newline(self) -> None:
