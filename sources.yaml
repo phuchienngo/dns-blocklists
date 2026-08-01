@@ -9,13 +9,15 @@ allowlist:
   - custom/allowlist.txt
 
 sources:
-  adblock:
-    - https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt
-    - https://easylist.to/easylist/easyprivacy.txt
+  rpz:
+    - https://small.oisd.nl/rpz
   hosts:
     - https://raw.githubusercontent.com/bigdargon/hostsVN/master/hosts
     - https://raw.githubusercontent.com/bigdargon/hostsVN/master/extensions/threat/hosts
   domains:
+    - https://v.firebog.net/hosts/AdguardDNS.txt
+    - https://v.firebog.net/hosts/Easyprivacy.txt
+    - https://raw.githubusercontent.com/mullvad/dns-blocklists/refs/heads/main/files/tracker
     - https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/popupads-onlydomains.txt
     - https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.amazon-onlydomains.txt
     - https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.apple-onlydomains.txt
