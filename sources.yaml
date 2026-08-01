@@ -9,6 +9,8 @@ allowlist:
   - custom/allowlist.txt
 
 sources:
+  rpz:
+    - https://small.oisd.nl/rpz
   adblock:
     - https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt
     - https://easylist.to/easylist/easyprivacy.txt
