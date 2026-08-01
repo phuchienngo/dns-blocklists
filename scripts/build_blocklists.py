@@ -36,6 +36,8 @@ DNSX_BATCH_SIZE = 2_000
 DNS_PRIMARY_HASHMAP_SIZE = 800
 DNS_RETRY_HASHMAP_SIZE = 200
 PROGRESS_PHASE_RANGES = ((0, 10), (10, 30), (30, 90), (90, 100))
+CUSTOM_BLOCKLIST_PATH = "custom/blocklist.txt"
+CUSTOM_ALLOWLIST_PATH = "custom/allowlist.txt"
 DomainEmitter = Callable[[str], None]
 
 
@@ -1243,18 +1245,25 @@ def build(
     if not source_configs:
         raise ValueError("sources must contain at least one URL or path")
 
-    allowlist = config.get("allowlist", [])
-    if not isinstance(allowlist, list):
-        raise ValueError("allowlist must be a list")
-    for location in allowlist:
-        if not isinstance(location, str) or not location:
-            raise ValueError("allowlist entries must be URLs or paths")
+    custom_blocklist = base_directory / CUSTOM_BLOCKLIST_PATH
+    if custom_blocklist.is_file():
         source_configs.append(
             (
-                location,
-                location,
+                CUSTOM_BLOCKLIST_PATH,
+                CUSTOM_BLOCKLIST_PATH,
                 "domains",
-                bool(urllib.parse.urlparse(location).scheme),
+                False,
+                "blocklist",
+            )
+        )
+    custom_allowlist = base_directory / CUSTOM_ALLOWLIST_PATH
+    if custom_allowlist.is_file():
+        source_configs.append(
+            (
+                CUSTOM_ALLOWLIST_PATH,
+                CUSTOM_ALLOWLIST_PATH,
+                "domains",
+                False,
                 "allowlist",
             )
         )
@@ -1414,7 +1423,7 @@ def build(
                 "CREATE TABLE removed(domain TEXT PRIMARY KEY) WITHOUT ROWID"
             )
             allowlisted_count = _exclude_allowlisted_domains(connection)
-            if allowlist:
+            if custom_allowlist.is_file():
                 print(
                     f"{_phase_label(2)} Allowlist applied: "
                     f"{_quantity(allowlisted_count, 'domain')} excluded",

@@ -667,20 +667,18 @@ class BuildTest(unittest.TestCase):
     def test_allowlist_excludes_domains_and_their_descendants(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "custom").mkdir()
             (root / "domains.txt").write_text(
                 "allowed.example.com\nsub.allowed.example.com\nads.example.com\n",
                 encoding="utf-8",
             )
-            (root / "allowlist.txt").write_text(
+            (root / "custom/allowlist.txt").write_text(
                 "allowed.example.com\n",
                 encoding="utf-8",
             )
 
             count = build(
-                config={
-                    "sources": {"domains": ["domains.txt"]},
-                    "allowlist": ["allowlist.txt"],
-                },
+                config={"sources": {"domains": ["domains.txt"]}},
                 base_directory=root,
                 output_directory=root / "output",
                 skip_dns=True,
@@ -694,6 +692,32 @@ class BuildTest(unittest.TestCase):
             self.assertEqual(
                 sorted(path.name for path in (root / "output").iterdir()),
                 ["blocklist.txt"],
+            )
+
+    def test_automatically_includes_custom_blocklist(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "custom").mkdir()
+            (root / "domains.txt").write_text(
+                "source.example.com\n",
+                encoding="utf-8",
+            )
+            (root / "custom/blocklist.txt").write_text(
+                "custom.example.com\n",
+                encoding="utf-8",
+            )
+
+            count = build(
+                config={"sources": {"domains": ["domains.txt"]}},
+                base_directory=root,
+                output_directory=root / "output",
+                skip_dns=True,
+            )
+
+            self.assertEqual(count, 2)
+            self.assertEqual(
+                (root / "output/blocklist.txt").read_text(encoding="utf-8"),
+                "custom.example.com\nsource.example.com",
             )
 
     def test_collapses_descendants_before_dns_validation(self) -> None:

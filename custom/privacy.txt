@@ -1,6 +1,0 @@
-socialapi.momo.vn
-socialapi.mservice.com.vn
-socialhub.momo.vn
-socialhub.mservice.com.vn
-social-dev.momocdn.net
-social.momocdn.net

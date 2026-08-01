@@ -29,9 +29,10 @@ Blocklist inputs are grouped by format under `sources` in `sources.yaml`. Each
 group contains URLs or repository-relative paths. Supported groups are
 `domains`, `hosts`, `adblock`, and `rpz`; empty groups may be omitted.
 
-`allowlist` contains domain-list URLs or paths whose entries must not appear in
-the output. An allowlisted domain also excludes all of its subdomains; it does
-not create a separate output list. `public_suffix_list` points to the current
+`custom/blocklist.txt` and `custom/allowlist.txt` are loaded automatically when
+present, so they do not need entries in `sources.yaml`. The blocklist file adds
+domains; an allowlisted domain and all of its subdomains are excluded without
+creating a separate output list. `public_suffix_list` points to the current
 [Public Suffix List](https://publicsuffix.org/list/public_suffix_list.dat).
 
 There are no categories or configured minimum and maximum list sizes.
@@ -49,8 +50,8 @@ expression, and disabled (`badfilter`) rules are ignored. RPZ zone syntax is
 parsed with `dnspython`; only owners redirected by `CNAME .` are treated as
 blocked domains.
 
-The build fails instead of publishing partial output when a blocklist,
-allowlist, the Public Suffix List, or either DNS validator cannot complete.
+The build fails instead of publishing partial output when a configured source,
+the Public Suffix List, or either DNS validator cannot complete.
 
 The build logs real completed work without timer heartbeats. Overall progress is
 split into download (0-10%), parse and merge (10-30%), MassDNS (30-90%), and

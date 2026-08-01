@@ -5,9 +5,6 @@ dns:
 
 public_suffix_list: https://raw.githubusercontent.com/publicsuffix/list/refs/heads/main/public_suffix_list.dat
 
-allowlist:
-  - custom/allowlist.txt
-
 sources:
   rpz:
     - https://small.oisd.nl/rpz
@@ -30,5 +27,3 @@ sources:
     - https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.xiaomi-onlydomains.txt
     - https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.samsung-onlydomains.txt
     - https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.roku-onlydomains.txt
-    - custom/adblock.txt
-    - custom/privacy.txt
