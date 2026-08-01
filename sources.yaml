@@ -9,14 +9,11 @@ allowlist:
   - custom/allowlist.txt
 
 sources:
-  rpz:
-    - https://small.oisd.nl/rpz
   adblock:
     - https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt
     - https://easylist.to/easylist/easyprivacy.txt
   hosts:
     - https://raw.githubusercontent.com/bigdargon/hostsVN/master/hosts
-    - https://raw.githubusercontent.com/bigdargon/hostsVN/master/extensions/gambling/hosts
     - https://raw.githubusercontent.com/bigdargon/hostsVN/master/extensions/threat/hosts
   domains:
     - https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/popupads-onlydomains.txt
