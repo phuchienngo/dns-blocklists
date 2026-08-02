@@ -11,13 +11,23 @@ Input wildcards such as `*.example.com` become `example.com`.
 
 Install `uv` and provide compatible
 [MassDNS](https://github.com/blechschmidt/massdns) and
-[dnsx](https://github.com/projectdiscovery/dnsx) executables on `PATH`. `uv`
-provisions Python 3.12 and all locked Python dependencies automatically.
+[dnsx](https://github.com/projectdiscovery/dnsx), and
+[Subfinder](https://github.com/projectdiscovery/subfinder) executables on
+`PATH`. `uv` provisions Python 3.12 and all locked Python dependencies
+automatically.
 
 ```bash
 uv run --locked python -m unittest discover -s tests -v
 uv run --locked python scripts/build_blocklists.py
 ```
+
+The executable in `scripts/build_blocklists.py` is a thin compatibility
+entrypoint. Implementation is split by responsibility under
+`blocklist_builder/`: `parsing.py` handles domain, hosts, Adblock, and RPZ
+input; `storage.py` owns SQLite and atomic output; `dns.py` orchestrates
+MassDNS and dnsx; `dns_records.py` checks CNAME and HTTPS records;
+`dns_discovery.py` performs Subfinder rescue; and `builder.py` coordinates
+the complete build.
 
 To rebuild sources without performing or updating DNS validation:
 
@@ -54,16 +64,18 @@ The build fails instead of publishing partial output when a configured source,
 the Public Suffix List, or any DNS validation stage cannot complete.
 
 The build logs real completed work without timer heartbeats. Overall progress is
-split into download (0-10%), parse and merge (10-30%), MassDNS (30-80%),
-extended DNS (80-95%), and dnsx fallback (95-100%). Download and parse advance
-after each source; each DNS stage advances after a completed batch. Extended
-DNS reports CNAME, HTTPS, and HTTPS IP-hint recoveries. dnsx reports recovered,
-explicitly removed, and still-unknown counts, or reports that it was skipped
-when MassDNS produced no unknown domains.
+split into download (0-10%), parse and merge (10-30%), MassDNS (30-70%),
+subdomain rescue (70-85%), extended DNS (85-95%), and dnsx fallback (95-100%).
+Download and parse advance after each source; each DNS stage advances after a
+completed batch. Subdomain rescue reports passive-discovery coverage and child
+validation progress. Extended DNS reports CNAME, HTTPS, and HTTPS IP-hint
+recoveries. dnsx reports recovered, explicitly removed, and still-unknown
+counts, or reports that it was skipped when MassDNS produced no unknown
+domains.
 
 MassDNS validation runs in batches of 10,000 domains. After every batch, the
-log reports cumulative processed, resolved, removed, extended-DNS-pending, and
-dnsx-pending counts.
+log reports cumulative processed, resolved, removed, subdomain-rescue-pending,
+extended-DNS-pending, and dnsx-pending counts.
 The dnsx fallback processes batches of 2,000 and logs cumulative processed,
 recovered, explicitly removed, and still-unknown counts. This provides exact
 progress without loading the full domain list into RAM.
@@ -87,6 +99,16 @@ without a global A address and without an NXDOMAIN response. Only transient or
 missing results are retried, using the same resolver pool with a lower hash-map
 size of 200.
 
+NXDOMAIN names are grouped by their registrable domain using the downloaded
+Public Suffix List. Subfinder performs one passive enumeration per unique root.
+Discovered names are mapped back to every NXDOMAIN parent they descend from and
+are checked with MassDNS. A parent is kept as soon as any discovered descendant
+has a globally routable A or AAAA address, even when the parent itself remains
+NXDOMAIN. A root for which passive discovery returns no data, or a child with a
+transient DNS result, remains unknown and is kept. This handles subtree rules
+such as `ads.oppomobile.com`, whose live services can exist only below the
+listed parent.
+
 Names for which both A and AAAA return NODATA are checked asynchronously with
 dnspython before removal. The checker follows CNAME and HTTPS AliasMode targets
 for up to eight levels, resolves HTTPS ServiceMode targets, and accepts globally
@@ -100,8 +122,10 @@ Remaining MassDNS transient or missing results are passed to dnsx in batches,
 with A and AAAA queries, the same resolver pool, and three retries.
 
 - A domain with any globally routable A or AAAA answer is kept.
-- NXDOMAIN is removed without an unnecessary AAAA query. Dual A/AAAA NODATA is
-  removed only when CNAME and HTTPS checks also find no usable endpoint.
+- NXDOMAIN skips the original-name AAAA query and enters passive subdomain
+  rescue. It is kept when any discovered descendant resolves or when discovery
+  has insufficient evidence. Dual A/AAAA NODATA is removed only when CNAME and
+  HTTPS checks also find no usable endpoint.
 - A domain with timeout, SERVFAIL, REFUSED, or missing MassDNS output is kept
   pending until dnsx rechecks it. If dnsx still returns no global A or AAAA
   address, the domain remains unknown and is kept; missing dnsx output is not
@@ -112,5 +136,5 @@ with A and AAAA queries, the same resolver pool, and three retries.
   link-local, and reserved IPs do not count as resolved.
 
 No DNS state is stored. GitHub Actions installs a pinned MassDNS Homebrew bottle
-and a checksum-verified pinned dnsx binary without a cache, runs full validation
-weekly, and commits updated output.
+and checksum-verified pinned dnsx and Subfinder binaries without a cache, runs
+full validation weekly, and commits updated output.
