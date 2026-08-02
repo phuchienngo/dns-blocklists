@@ -11,9 +11,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from publicsuffix2 import PublicSuffixList
-
-from blocklist_builder.dns import validate_dns_database as _validate_dns_database
 from blocklist_builder.storage import (
     atomic_write_domains as _atomic_write_domains,
     collapse_parent_domains as _collapse_parent_domains,
@@ -23,16 +20,12 @@ from blocklist_builder.storage import (
     merge_allowlist as _merge_allowlist,
     merge_source as _merge_source,
     parse_source_into_database as _parse_source_into_database,
-    remove_unresolved_domains as _remove_unresolved_domains,
 )
 
 PROGRESS_PHASE_RANGES = (
-    (0, 10),
-    (10, 30),
-    (30, 70),
-    (70, 85),
-    (85, 95),
-    (95, 100),
+    (0, 20),
+    (20, 90),
+    (90, 100),
 )
 CUSTOM_BLOCKLIST_PATH = "custom/blocklist.txt"
 CUSTOM_ALLOWLIST_PATH = "custom/allowlist.txt"
@@ -82,15 +75,10 @@ def build(
     config: dict[str, Any],
     base_directory: Path,
     output_directory: Path,
-    skip_dns: bool = False,
     fetch_text: Callable[[str], str] | None = None,
-    dns_validator: Callable[
-        [sqlite3.Connection, dict[str, Any]], None
-    ] | None = None,
 ) -> int:
     started_at = time.monotonic()
     sources = config.get("sources")
-    dns_config = config.get("dns", {})
     if not isinstance(sources, dict) or not sources:
         raise ValueError("sources must be a non-empty format mapping")
     source_configs: list[tuple[str, str, str, bool, str]] = []
@@ -159,10 +147,9 @@ def build(
         )
 
     print(
-        "Starting build: 6 phases "
-        "(download 0-10%, parse 10-30%, "
-        "MassDNS 30-70%, subdomain rescue 70-85%, "
-        "extended DNS 85-95%, dnsx 95-100%)",
+        "Starting build: 3 phases "
+        "(download 0-20%, parse/filter 20-90%, "
+        "write 90-100%)",
         flush=True,
     )
 
@@ -291,9 +278,6 @@ def build(
                     flush=True,
                 )
 
-            connection.execute(
-                "CREATE TABLE removed(domain TEXT PRIMARY KEY) WITHOUT ROWID"
-            )
             allowlisted_count = _exclude_allowlisted_domains(connection)
             if custom_allowlist.is_file():
                 print(
@@ -311,13 +295,6 @@ def build(
                     f"{_quantity(public_suffix_count, 'domain')} excluded",
                     flush=True,
                 )
-                with public_suffix_path.open(encoding="utf-8") as suffixes:
-                    dns_public_suffixes = PublicSuffixList(
-                        suffixes,
-                        idna=True,
-                    )
-            else:
-                dns_public_suffixes = PublicSuffixList()
 
             print(
                 f"{_phase_label(2)} Parent-domain collapse started",
@@ -330,109 +307,19 @@ def build(
                 flush=True,
             )
 
-            unique_count = connection.execute(
-                "SELECT COUNT(*) FROM (SELECT domain FROM domains GROUP BY domain)"
-            ).fetchone()[0]
-            massdns_start_label = _phase_label(3, progress=0.0)
-            massdns_end_label = _phase_label(3)
-            rescue_end_label = _phase_label(4)
-            extended_end_label = _phase_label(5)
-            dnsx_end_label = _phase_label(6)
-            if not skip_dns:
-                print(
-                    f"{massdns_start_label} MassDNS validation started: "
-                    "resolving "
-                    f"{_quantity(unique_count, 'unique domain')}",
-                    flush=True,
-                )
-                if dns_validator is None:
-                    _validate_dns_database(
-                        connection,
-                        dns_config,
-                        public_suffixes=dns_public_suffixes,
-                        progress_formatter=lambda fraction: _phase_label(
-                            3,
-                            progress=fraction,
-                        ),
-                        rescue_progress_formatter=lambda fraction: (
-                            _phase_label(4, progress=fraction)
-                        ),
-                        extended_progress_formatter=lambda fraction: (
-                            _phase_label(5, progress=fraction)
-                        ),
-                        dnsx_progress_formatter=lambda fraction: _phase_label(
-                            6,
-                            progress=fraction,
-                        ),
-                    )
-                else:
-                    dns_validator(connection, dns_config)
-                _remove_unresolved_domains(connection)
-                removed_count = connection.execute(
-                    "SELECT COUNT(*) FROM removed"
-                ).fetchone()[0]
-                print(
-                    f"{dnsx_end_label} DNS validation complete: "
-                    f"{_quantity(unique_count - removed_count, 'domain')} kept, "
-                    f"{_quantity(removed_count, 'domain')} removed",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"{massdns_end_label} MassDNS validation skipped: "
-                    "retaining "
-                    f"{_quantity(unique_count, 'unique domain')}",
-                    flush=True,
-                )
-                print(
-                    f"{rescue_end_label} Subdomain rescue skipped",
-                    flush=True,
-                )
-                print(
-                    f"{extended_end_label} Extended DNS skipped",
-                    flush=True,
-                )
-                print(
-                    f"{dnsx_end_label} dnsx fallback skipped",
-                    flush=True,
-                )
-
             output_count = connection.execute(
-                """
-                SELECT COUNT(*)
-                FROM domains AS d
-                WHERE NOT EXISTS (
-                      SELECT 1 FROM removed AS r
-                      WHERE r.domain = d.domain
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM redundant
-                      WHERE redundant.domain = d.domain
-                  )
-                """
+                "SELECT COUNT(*) FROM domains"
             ).fetchone()[0]
 
             output_directory.mkdir(parents=True, exist_ok=True)
             print(
-                f"{dnsx_end_label} "
+                f"{_phase_label(3, progress=0.0)} "
                 "Writing blocklist.txt: "
                 f"{_quantity(output_count, 'domain')}",
                 flush=True,
             )
             rows = connection.execute(
-                """
-                SELECT d.domain
-                FROM domains AS d
-                WHERE NOT EXISTS (
-                      SELECT 1 FROM removed AS r
-                      WHERE r.domain = d.domain
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM redundant
-                      WHERE redundant.domain = d.domain
-                  )
-                ORDER BY d.domain
-                """
+                "SELECT domain FROM domains ORDER BY domain"
             )
             _atomic_write_domains(
                 output_directory / "blocklist.txt",
@@ -442,7 +329,7 @@ def build(
                 if old_output.name != "blocklist.txt":
                     old_output.unlink()
     print(
-        f"{_phase_label(6)} "
+        f"{_phase_label(3)} "
         f"Build complete in {time.monotonic() - started_at:.1f}s",
         flush=True,
     )
@@ -475,11 +362,6 @@ def main() -> None:
         type=Path,
         default=repository / "output",
     )
-    parser.add_argument(
-        "--skip-dns",
-        action="store_true",
-        help="Build source lists without running or updating DNS validation",
-    )
     args = parser.parse_args()
 
     config_path = args.config.resolve()
@@ -487,7 +369,6 @@ def main() -> None:
         config=load_config(config_path),
         base_directory=config_path.parent,
         output_directory=args.output.resolve(),
-        skip_dns=args.skip_dns,
     )
     print(f"blocklist: {count} output domains")
 

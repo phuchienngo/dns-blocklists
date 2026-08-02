@@ -1,6 +1,5 @@
-import sqlite3
+import inspect
 import tempfile
-import time
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
@@ -27,7 +26,6 @@ class BuildTest(unittest.TestCase):
                 },
                 base_directory=root,
                 output_directory=root / "output",
-                skip_dns=True,
                 fetch_text=lambda _: (
                     "// ===BEGIN ICANN DOMAINS===\ncom\norg\n"
                     "// ===BEGIN PRIVATE DOMAINS===\nduckdns.org\n"
@@ -57,7 +55,6 @@ class BuildTest(unittest.TestCase):
                 config={"sources": {"domains": ["domains.txt"]}},
                 base_directory=root,
                 output_directory=root / "output",
-                skip_dns=True,
             )
 
             self.assertEqual(count, 1)
@@ -87,7 +84,6 @@ class BuildTest(unittest.TestCase):
                 config={"sources": {"domains": ["domains.txt"]}},
                 base_directory=root,
                 output_directory=root / "output",
-                skip_dns=True,
             )
 
             self.assertEqual(count, 2)
@@ -96,45 +92,23 @@ class BuildTest(unittest.TestCase):
                 "custom.example.com\nsource.example.com",
             )
 
-    def test_collapses_descendants_before_dns_validation(self) -> None:
+    def test_collapses_descendants_without_dns_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "domains.txt").write_text(
                 "dead-parent.example\nlive.dead-parent.example\n",
                 encoding="utf-8",
             )
-            validated: list[str] = []
-
-            def validate(
-                connection: sqlite3.Connection,
-                _dns_config: dict,
-            ) -> None:
-                validated.extend(
-                    domain
-                    for (domain,) in connection.execute(
-                        "SELECT domain FROM domains ORDER BY domain"
-                    )
-                )
-                connection.execute(
-                    """
-                    CREATE TABLE dns_resolved (
-                        domain TEXT PRIMARY KEY
-                    ) WITHOUT ROWID
-                    """
-                )
-
             count = build(
                 config={"sources": {"domains": ["domains.txt"]}},
                 base_directory=root,
                 output_directory=root / "output",
-                dns_validator=validate,
             )
 
-            self.assertEqual(validated, ["dead-parent.example"])
-            self.assertEqual(count, 0)
+            self.assertEqual(count, 1)
             self.assertEqual(
                 (root / "output/blocklist.txt").read_text(encoding="utf-8"),
-                "",
+                "dead-parent.example",
             )
 
     def test_accepts_sources_grouped_by_format(self) -> None:
@@ -149,7 +123,6 @@ class BuildTest(unittest.TestCase):
                     config=config,
                     base_directory=root,
                     output_directory=root / "output",
-                    skip_dns=True,
                     fetch_text=lambda _: "||ads.example.com^\n",
                 )
             except Exception as error:
@@ -183,38 +156,16 @@ class BuildTest(unittest.TestCase):
                 "sources": {"domains": ["first.txt", "second.txt"]}
             }
 
-            def validate(
-                connection: sqlite3.Connection,
-                _dns_config: dict,
-            ) -> None:
-                connection.execute(
-                    """
-                    CREATE TABLE dns_resolved (
-                        domain TEXT PRIMARY KEY
-                    ) WITHOUT ROWID
-                    """
-                )
-                connection.executemany(
-                    "INSERT INTO dns_resolved VALUES (?)",
-                    [
-                        ("example.com",),
-                        ("a.example.com",),
-                        ("b.a.example.com",),
-                        ("live.dead-parent.com",),
-                    ],
-                )
-
             counts = build(
                 config=config,
                 base_directory=root,
                 output_directory=root / "output",
-                dns_validator=validate,
             )
 
-            self.assertEqual(counts, 1)
+            self.assertEqual(counts, 2)
             self.assertEqual(
                 (root / "output/blocklist.txt").read_text(encoding="utf-8"),
-                "example.com",
+                "dead-parent.com\nexample.com",
             )
 
     def test_does_not_emit_timer_heartbeat(self) -> None:
@@ -227,25 +178,11 @@ class BuildTest(unittest.TestCase):
             config = {"sources": {"domains": ["custom.txt"]}}
             output = StringIO()
 
-            def slow_validator(
-                connection: sqlite3.Connection,
-                _dns_config: dict,
-            ) -> None:
-                time.sleep(0.04)
-                connection.execute(
-                    """
-                    CREATE TABLE dns_resolved (
-                        domain TEXT PRIMARY KEY
-                    ) WITHOUT ROWID
-                    """
-                )
-
             with redirect_stdout(output):
                 build(
                     config=config,
                     base_directory=root,
                     output_directory=root / "output",
-                    dns_validator=slow_validator,
                 )
 
             self.assertNotIn("still running", output.getvalue())
@@ -261,63 +198,46 @@ class BuildTest(unittest.TestCase):
                     config=config,
                     base_directory=root,
                     output_directory=root / "output",
-                    skip_dns=True,
                     fetch_text=lambda _: "ads.example.com\n",
                 )
 
             log = output.getvalue()
             self.assertIn(
-                "Starting build: 6 phases "
-                "(download 0-10%, parse 10-30%, "
-                "MassDNS 30-70%, subdomain rescue 70-85%, "
-                "extended DNS 85-95%, dnsx 95-100%)",
+                "Starting build: 3 phases "
+                "(download 0-20%, parse/filter 20-90%, "
+                "write 90-100%)",
                 log,
             )
             self.assertIn(
-                "[phase 1/6 | 0.0%] [download 1/1] "
+                "[phase 1/3 | 0.0%] [download 1/1] "
                 "Downloading memory://ads",
                 log,
             )
             self.assertIn(
-                "[phase 1/6 | 10.0%] [download 1/1] "
+                "[phase 1/3 | 20.0%] [download 1/1] "
                 "Downloaded memory://ads",
                 log,
             )
             self.assertIn(
-                "[phase 2/6 | 10.0%] [parse 1/1] "
+                "[phase 2/3 | 20.0%] [parse 1/1] "
                 "Parsing memory://ads",
                 log,
             )
             self.assertIn(
-                "[phase 2/6 | 30.0%] [parse 1/1] "
+                "[phase 2/3 | 90.0%] [parse 1/1] "
                 "Parsed memory://ads: 1 domain",
                 log,
             )
             self.assertIn(
-                "[phase 3/6 | 70.0%] MassDNS validation skipped: "
-                "retaining 1 unique domain",
+                "[phase 3/3 | 90.0%] Writing blocklist.txt: 1 domain",
                 log,
             )
             self.assertIn(
-                "[phase 4/6 | 85.0%] Subdomain rescue skipped",
+                "[phase 3/3 | 100.0%] Build complete in ",
                 log,
             )
-            self.assertIn(
-                "[phase 5/6 | 95.0%] Extended DNS skipped",
-                log,
-            )
-            self.assertIn(
-                "[phase 6/6 | 100.0%] dnsx fallback skipped",
-                log,
-            )
-            self.assertIn(
-                "[phase 6/6 | 100.0%] Writing blocklist.txt: 1 domain",
-                log,
-            )
-            self.assertIn(
-                "[phase 6/6 | 100.0%] Build complete in ",
-                log,
-            )
+            self.assertNotIn("DNS", log)
+            self.assertNotIn("dns", log)
 
     def test_builds_one_output_from_url_list(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -340,7 +260,6 @@ class BuildTest(unittest.TestCase):
                         config=config,
                         base_directory=root,
                         output_directory=root / "output",
-                        skip_dns=True,
                         fetch_text=lambda _: (
                             "ads.example.com\nallowed.example.com\n"
                             "ads.example.com\n"
@@ -355,26 +274,22 @@ class BuildTest(unittest.TestCase):
                 "ads.example.com\nallowed.example.com\n"
                 "local.example.com\nshared.example.com",
             )
-    def test_dns_failure_keeps_existing_output(self) -> None:
+    def test_source_failure_keeps_existing_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "output"
             output.mkdir()
             existing = output / "blocklist.txt"
             existing.write_text("existing.example.com\n", encoding="utf-8")
-            config = {"sources": {"domains": ["custom.txt"]}}
-            (root / "custom.txt").write_text(
-                "new.example.com\n",
-                encoding="utf-8",
-            )
+            config = {"sources": {"domains": ["memory://broken"]}}
 
-            with self.assertRaisesRegex(RuntimeError, "DNS failed"):
+            with self.assertRaisesRegex(RuntimeError, "source unavailable"):
                 build(
                     config=config,
                     base_directory=root,
                     output_directory=output,
-                    dns_validator=lambda *_: (_ for _ in ()).throw(
-                        RuntimeError("DNS failed")
+                    fetch_text=lambda *_: (_ for _ in ()).throw(
+                        RuntimeError("source unavailable")
                     ),
                 )
 
@@ -383,36 +298,11 @@ class BuildTest(unittest.TestCase):
                 "existing.example.com\n",
             )
 
-    def test_all_unresolved_domains_can_produce_empty_output(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "custom.txt").write_text(
-                "live.example.com\ndead.example.com\n",
-                encoding="utf-8",
-            )
-            config = {"sources": {"domains": ["custom.txt"]}}
+    def test_build_api_has_no_dns_controls(self) -> None:
+        parameters = inspect.signature(build).parameters
 
-            def resolve(connection, _dns_config) -> None:
-                connection.execute(
-                    """
-                    CREATE TABLE dns_resolved (
-                        domain TEXT PRIMARY KEY
-                    ) WITHOUT ROWID;
-                    """
-                )
-
-            counts = build(
-                config=config,
-                base_directory=root,
-                output_directory=root / "output",
-                dns_validator=resolve,
-            )
-
-            self.assertEqual(counts, 0)
-            self.assertEqual(
-                (root / "output/blocklist.txt").read_text(encoding="utf-8"),
-                "",
-            )
+        self.assertNotIn("skip_dns", parameters)
+        self.assertNotIn("dns_validator", parameters)
 
 
 if __name__ == "__main__":

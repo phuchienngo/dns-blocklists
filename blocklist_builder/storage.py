@@ -10,49 +10,6 @@ from publicsuffix2 import PublicSuffixList
 from blocklist_builder.parsing import parse_lines
 
 
-def _remove_unresolved_domains(
-    connection: sqlite3.Connection,
-) -> None:
-    connection.execute(
-        """
-        INSERT INTO removed(domain)
-        SELECT global_domains.domain
-        FROM (
-            SELECT domain
-            FROM domains
-            GROUP BY domain
-        ) AS global_domains
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM dns_resolved AS resolved
-            WHERE resolved.domain = global_domains.domain
-        )
-          AND (
-              EXISTS (
-                  SELECT 1
-                  FROM dnsx_negative AS negative
-                  WHERE negative.domain = global_domains.domain
-              )
-              OR NOT EXISTS (
-                  SELECT 1
-                  FROM dns_unknown AS unknown
-                  WHERE unknown.domain = global_domains.domain
-              )
-          )
-          AND NOT EXISTS (
-              SELECT 1
-              FROM dns_extended_unknown AS unknown
-              WHERE unknown.domain = global_domains.domain
-          )
-          AND NOT EXISTS (
-              SELECT 1
-              FROM dns_rescue_unknown AS unknown
-              WHERE unknown.domain = global_domains.domain
-          )
-        """
-    )
-
-
 def _collapse_parent_domains(
     connection: sqlite3.Connection,
 ) -> int:
@@ -66,11 +23,6 @@ def _collapse_parent_domains(
                 SUBSTR(child.domain, INSTR(child.domain, '.') + 1)
             FROM domains AS child
             WHERE INSTR(child.domain, '.') > 0
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM removed
-                  WHERE removed.domain = child.domain
-              )
 
             UNION ALL
 
@@ -85,11 +37,6 @@ def _collapse_parent_domains(
         FROM ancestors AS ancestor
         JOIN domains AS parent
           ON parent.domain = ancestor.parent
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM removed
-            WHERE removed.domain = parent.domain
-        )
         """
     )
     collapsed_count = connection.total_changes - changes_before
@@ -209,43 +156,6 @@ def _initialize_database(connection: sqlite3.Connection) -> None:
         CREATE TABLE allowlist_domains (
             domain TEXT PRIMARY KEY
         ) WITHOUT ROWID;
-        CREATE TABLE dns_unknown (
-            domain TEXT PRIMARY KEY
-        ) WITHOUT ROWID;
-        CREATE TABLE dnsx_negative (
-            domain TEXT PRIMARY KEY
-        ) WITHOUT ROWID;
-        CREATE TABLE dns_extended_candidates (
-            domain TEXT PRIMARY KEY
-        ) WITHOUT ROWID;
-        CREATE TABLE dns_extended_unknown (
-            domain TEXT PRIMARY KEY
-        ) WITHOUT ROWID;
-        CREATE TABLE dns_nxdomain_candidates (
-            domain TEXT PRIMARY KEY
-        ) WITHOUT ROWID;
-        CREATE TABLE dns_rescue_candidate_roots (
-            domain TEXT PRIMARY KEY,
-            root TEXT NOT NULL
-        ) WITHOUT ROWID;
-        CREATE TABLE dns_discovered_roots (
-            root TEXT PRIMARY KEY
-        ) WITHOUT ROWID;
-        CREATE TABLE dns_discovered_hosts (
-            domain TEXT PRIMARY KEY,
-            root TEXT NOT NULL
-        ) WITHOUT ROWID;
-        CREATE TABLE dns_discovered_children (
-            child TEXT NOT NULL,
-            parent TEXT NOT NULL,
-            PRIMARY KEY (child, parent)
-        ) WITHOUT ROWID;
-        CREATE TABLE dns_rescue_unknown (
-            domain TEXT PRIMARY KEY
-        ) WITHOUT ROWID;
-        CREATE TEMP TABLE dns_rescue_batch (
-            child TEXT PRIMARY KEY
-        ) WITHOUT ROWID;
         CREATE TABLE redundant (
             domain TEXT PRIMARY KEY
         ) WITHOUT ROWID;
@@ -316,9 +226,7 @@ initialize_database = _initialize_database
 collapse_parent_domains = _collapse_parent_domains
 exclude_allowlisted_domains = _exclude_allowlisted_domains
 exclude_public_suffixes = _exclude_public_suffixes
-remove_unresolved_domains = _remove_unresolved_domains
 atomic_write_domains = _atomic_write_domains
 parse_source_into_database = _parse_source_into_database
 merge_source = _merge_source
 merge_allowlist = _merge_allowlist
-
