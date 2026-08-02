@@ -4,6 +4,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from blocklist_builder.storage import atomic_write_domains as _atomic_write_doma
 
 DNS_BATCH_SIZE = 10_000
 DNS_PRIMARY_HASHMAP_SIZE = 800
+SUBFINDER_BATCH_SIZE = 100
 SUBFINDER_MAX_TIME_MINUTES = 10
 
 
@@ -132,61 +134,17 @@ def _rescue_nxdomain_domains(
         input_path = temporary / "children.txt"
         output_path = temporary / "massdns.jsonl"
         massdns_error_path = temporary / "massdns.err"
-        _atomic_write_domains(
-            roots_path,
-            connection.execute(
-                """
-                SELECT DISTINCT root
-                FROM dns_rescue_candidate_roots
-                ORDER BY root
-                """
-            ),
-        )
         resolver_path.write_text(
             "".join(
                 f"{resolver}\n" for resolver in dns_config["resolvers"]
             ),
             encoding="utf-8",
         )
-        command = [
-            subfinder_executable,
-            "-dL",
-            str(roots_path),
-            "-silent",
-            "-duc",
-            "-max-time",
-            str(SUBFINDER_MAX_TIME_MINUTES),
-            "-o",
-            str(subdomains_path),
-        ]
-        try:
-            with subfinder_error_path.open("w", encoding="utf-8") as errors:
-                subprocess.run(
-                    command,
-                    stdout=subprocess.DEVNULL,
-                    stderr=errors,
-                    check=True,
-                    timeout=command_timeout,
-                )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO dns_rescue_unknown
-                SELECT domain FROM dns_nxdomain_candidates
-                """
-            )
-            end_label = (
-                progress_formatter(1.0) if progress_formatter else ""
-            )
-            print(
-                f"{end_label + ' ' if end_label else ''}"
-                "Subfinder discovery failed; all NXDOMAIN parents kept unknown",
-                flush=True,
-            )
-            return
-
-        discovered_rows: list[tuple[str, str]] = []
-        if subdomains_path.is_file():
+        def store_discovered_subdomains() -> int:
+            if not subdomains_path.is_file():
+                return 0
+            changes_before = connection.total_changes
+            discovered_rows: list[tuple[str, str]] = []
             with subdomains_path.open(encoding="utf-8") as subdomains:
                 for raw_line in subdomains:
                     domain = normalize_domain(raw_line)
@@ -205,11 +163,110 @@ def _rescue_nxdomain_domains(
                             discovered_rows,
                         )
                         discovered_rows.clear()
-        if discovered_rows:
-            connection.executemany(
-                "INSERT OR IGNORE INTO dns_discovered_hosts VALUES (?, ?)",
-                discovered_rows,
-            )
+            if discovered_rows:
+                connection.executemany(
+                    "INSERT OR IGNORE INTO dns_discovered_hosts VALUES (?, ?)",
+                    discovered_rows,
+                )
+            return connection.total_changes - changes_before
+
+        def error_summary() -> str:
+            try:
+                message = " ".join(
+                    subfinder_error_path.read_text(
+                        encoding="utf-8",
+                        errors="replace",
+                    ).split()
+                )
+            except OSError:
+                return ""
+            if len(message) > 300:
+                return f"{message[:297]}..."
+            return message
+
+        root_cursor = connection.execute(
+            """
+            SELECT DISTINCT root
+            FROM dns_rescue_candidate_roots
+            ORDER BY root
+            """
+        )
+        total_discovery_batches = (
+            root_count + SUBFINDER_BATCH_SIZE - 1
+        ) // SUBFINDER_BATCH_SIZE
+        discovery_deadline = time.monotonic() + command_timeout
+        processed_roots = 0
+        failed_batches = 0
+        discovery_batch_index = 0
+        while roots := root_cursor.fetchmany(SUBFINDER_BATCH_SIZE):
+            discovery_batch_index += 1
+            _atomic_write_domains(roots_path, roots)
+            subdomains_path.unlink(missing_ok=True)
+            subfinder_error_path.unlink(missing_ok=True)
+            command = [
+                subfinder_executable,
+                "-dL",
+                str(roots_path),
+                "-silent",
+                "-duc",
+                "-max-time",
+                str(SUBFINDER_MAX_TIME_MINUTES),
+                "-o",
+                str(subdomains_path),
+            ]
+            failure: str | None = None
+            stage_timed_out = False
+            remaining_seconds = discovery_deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                failure = f"timeout after {command_timeout}s stage limit"
+                stage_timed_out = True
+            else:
+                try:
+                    with subfinder_error_path.open(
+                        "w", encoding="utf-8"
+                    ) as errors:
+                        subprocess.run(
+                            command,
+                            stdout=subprocess.DEVNULL,
+                            stderr=errors,
+                            check=True,
+                            timeout=remaining_seconds,
+                        )
+                except subprocess.CalledProcessError as error:
+                    failure = f"exit {error.returncode}"
+                except subprocess.TimeoutExpired:
+                    failure = f"timeout after {command_timeout}s stage limit"
+                    stage_timed_out = True
+
+            batch_discovered = store_discovered_subdomains()
+            processed_roots += len(roots)
+            fraction = 0.3 * processed_roots / root_count
+            label = progress_formatter(fraction) if progress_formatter else ""
+            if failure is None:
+                print(
+                    f"{label + ' ' if label else ''}"
+                    f"Subfinder batch {discovery_batch_index}/"
+                    f"{total_discovery_batches} complete: processed "
+                    f"{processed_roots:,}/{root_count:,} roots, found "
+                    f"{_quantity(batch_discovered, 'subdomain')}",
+                    flush=True,
+                )
+            else:
+                failed_batches += 1
+                details = error_summary()
+                details_label = f": {details}" if details else ""
+                print(
+                    f"{label + ' ' if label else ''}"
+                    f"Subfinder batch {discovery_batch_index}/"
+                    f"{total_discovery_batches} failed ({failure})"
+                    f"{details_label}; processed "
+                    f"{processed_roots:,}/{root_count:,} roots, found "
+                    f"{_quantity(batch_discovered, 'subdomain')}",
+                    flush=True,
+                )
+            if stage_timed_out:
+                break
+
         connection.execute(
             """
             DELETE FROM dns_discovered_hosts
@@ -235,11 +292,17 @@ def _rescue_nxdomain_domains(
         discovery_label = (
             progress_formatter(0.3) if progress_formatter else ""
         )
+        failure_summary = (
+            f", {failed_batches}/{total_discovery_batches} batches failed"
+            if failed_batches
+            else ""
+        )
         print(
             f"{discovery_label + ' ' if discovery_label else ''}"
             f"Subfinder discovery complete: "
             f"{_quantity(discovered_count, 'subdomain')} found, "
-            f"{covered_count:,}/{root_count:,} roots covered",
+            f"{covered_count:,}/{root_count:,} roots covered"
+            f"{failure_summary}",
             flush=True,
         )
 
@@ -444,4 +507,3 @@ def _rescue_nxdomain_domains(
 
 
 rescue_nxdomain_domains = _rescue_nxdomain_domains
-

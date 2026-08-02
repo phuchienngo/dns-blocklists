@@ -101,13 +101,16 @@ size of 200.
 
 NXDOMAIN names are grouped by their registrable domain using the downloaded
 Public Suffix List. Subfinder performs one passive enumeration per unique root.
-Discovered names are mapped back to every NXDOMAIN parent they descend from and
-are checked with MassDNS. A parent is kept as soon as any discovered descendant
-has a globally routable A or AAAA address, even when the parent itself remains
-NXDOMAIN. A root for which passive discovery returns no data, or a child with a
-transient DNS result, remains unknown and is kept. This handles subtree rules
-such as `ads.oppomobile.com`, whose live services can exist only below the
-listed parent.
+Roots are passed to Subfinder in batches of 100 so the log reports completed
+work and a failed batch does not discard earlier discoveries. A compact stderr
+reason is logged for failed batches; partial output and successful batches are
+still processed. Discovered names are mapped back to every NXDOMAIN parent they
+descend from and are checked with MassDNS. A parent is kept as soon as any
+discovered descendant has a globally routable A or AAAA address, even when the
+parent itself remains NXDOMAIN. A root for which passive discovery returns no
+data, or a child with a transient DNS result, remains unknown and is kept. This
+handles subtree rules such as `ads.oppomobile.com`, whose live services can
+exist only below the listed parent.
 
 Names for which both A and AAAA return NODATA are checked asynchronously with
 dnspython before removal. The checker follows CNAME and HTTPS AliasMode targets

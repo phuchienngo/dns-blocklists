@@ -11,6 +11,116 @@ import blocklist_builder.storage as storage
 
 
 class SubdomainRescueTest(unittest.TestCase):
+    def test_preserves_successful_batches_when_a_later_batch_fails(
+        self,
+    ) -> None:
+        with sqlite3.connect(":memory:") as connection:
+            storage._initialize_database(connection)
+            connection.executemany(
+                "INSERT INTO domains VALUES (?)",
+                [
+                    ("ads.a.test",),
+                    ("ads.b.test",),
+                    ("ads.c.test",),
+                ],
+            )
+            connection.execute(
+                "INSERT INTO dns_nxdomain_candidates SELECT domain FROM domains"
+            )
+            subfinder_batches: list[list[str]] = []
+
+            def complete_tools(command, **kwargs) -> None:
+                if command[0] == "/subfinder":
+                    roots = (
+                        Path(command[command.index("-dL") + 1])
+                        .read_text(encoding="utf-8")
+                        .splitlines()
+                    )
+                    subfinder_batches.append(roots)
+                    if roots == ["c.test"]:
+                        kwargs["stderr"].write("provider unavailable\n")
+                        kwargs["stderr"].flush()
+                        raise builder.subprocess.CalledProcessError(7, command)
+                    Path(command[command.index("-o") + 1]).write_text(
+                        "live.ads.a.test\n",
+                        encoding="utf-8",
+                    )
+                    return
+
+                query_type = command[command.index("-t") + 1]
+                output_path = Path(command[command.index("-w") + 1])
+                answers = (
+                    [{"type": "A", "data": "93.184.216.34"}]
+                    if query_type == "A"
+                    else []
+                )
+                output_path.write_text(
+                    json.dumps(
+                        {
+                            "name": "live.ads.a.test",
+                            "type": query_type,
+                            "status": "NOERROR",
+                            "data": {"answers": answers},
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+            progress = StringIO()
+            with (
+                patch.object(builder, "SUBFINDER_BATCH_SIZE", 2),
+                patch.object(
+                    builder.shutil,
+                    "which",
+                    side_effect=lambda executable: f"/{executable}",
+                ),
+                patch.object(
+                    builder.subprocess,
+                    "run",
+                    side_effect=complete_tools,
+                ),
+                redirect_stdout(progress),
+            ):
+                builder._rescue_nxdomain_domains(
+                    connection,
+                    {"resolvers": ["1.1.1.1"]},
+                    builder.PublicSuffixList(["test"]),
+                )
+
+            self.assertEqual(
+                subfinder_batches,
+                [["a.test", "b.test"], ["c.test"]],
+            )
+            self.assertEqual(
+                list(
+                    connection.execute(
+                        "SELECT domain FROM dns_resolved "
+                        "WHERE domain IN (SELECT domain FROM domains)"
+                    )
+                ),
+                [("ads.a.test",)],
+            )
+            self.assertEqual(
+                list(
+                    connection.execute(
+                        "SELECT domain FROM dns_rescue_unknown ORDER BY domain"
+                    )
+                ),
+                [("ads.b.test",), ("ads.c.test",)],
+            )
+            log = progress.getvalue()
+            self.assertIn(
+                "Subfinder batch 1/2 complete: processed 2/3 roots, "
+                "found 1 subdomain",
+                log,
+            )
+            self.assertIn(
+                "Subfinder batch 2/2 failed (exit 7): provider unavailable; "
+                "processed 3/3 roots",
+                log,
+            )
+
     def test_keeps_nxdomain_parent_when_any_discovered_child_resolves(
         self,
     ) -> None:
@@ -147,4 +257,3 @@ class SubdomainRescueTest(unittest.TestCase):
                 "1 removed, 1 unknown kept",
                 progress.getvalue(),
             )
-
