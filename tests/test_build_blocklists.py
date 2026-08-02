@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 import tempfile
 import textwrap
@@ -8,6 +9,9 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
+
+import dns.resolver
+import dns.rrset
 
 import scripts.build_blocklists as builder
 from scripts.build_blocklists import (
@@ -100,6 +104,75 @@ class ParseContentTest(unittest.TestCase):
 
 
 class DnsClassificationTest(unittest.TestCase):
+    def test_only_dual_nodata_is_sent_to_extended_dns(self) -> None:
+        with sqlite3.connect(":memory:") as connection:
+            builder._initialize_database(connection)
+            connection.executemany(
+                "INSERT INTO domains VALUES (?)",
+                [("dead.example",), ("nodata.example",)],
+            )
+            extended_candidates: list[str] = []
+
+            def complete_massdns(command, **_kwargs) -> None:
+                query_type = command[command.index("-t") + 1]
+                domains = Path(command[-1]).read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                output_path = Path(command[command.index("-w") + 1])
+                rows = []
+                for domain in domains:
+                    rows.append(
+                        json.dumps(
+                            {
+                                "name": domain,
+                                "type": query_type,
+                                "status": (
+                                    "NXDOMAIN"
+                                    if domain == "dead.example"
+                                    else "NOERROR"
+                                ),
+                                "data": {"answers": []},
+                            }
+                        )
+                    )
+                output_path.write_text(
+                    "\n".join(rows) + "\n", encoding="utf-8"
+                )
+
+            def capture_extended(connection, *_args, **_kwargs) -> None:
+                extended_candidates.extend(
+                    domain
+                    for (domain,) in connection.execute(
+                        "SELECT domain FROM dns_extended_candidates "
+                        "ORDER BY domain"
+                    )
+                )
+
+            with (
+                patch.object(
+                    builder.shutil,
+                    "which",
+                    side_effect=lambda executable: f"/{executable}",
+                ),
+                patch.object(
+                    builder.subprocess,
+                    "run",
+                    side_effect=complete_massdns,
+                ),
+                patch.object(
+                    builder,
+                    "_validate_extended_dns_database",
+                    side_effect=capture_extended,
+                ) as extended,
+            ):
+                builder._validate_dns_database(
+                    connection,
+                    {"resolvers": ["1.1.1.1"]},
+                )
+
+            extended.assert_called_once()
+            self.assertEqual(extended_candidates, ["nodata.example"])
+
     def test_massdns_reports_cumulative_batch_progress(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -199,15 +272,15 @@ class DnsClassificationTest(unittest.TestCase):
             self.assertEqual(counts, 3)
             log = output.getvalue()
             self.assertIn(
-                "[phase 3/4 | 54.0%] DNS batch 1/3 complete: "
+                "[phase 3/5 | 50.0%] DNS batch 1/3 complete: "
                 "processed 2/5 (40.0%), resolved 1, removed 1, "
-                "pending dnsx 0",
+                "pending extended 0, pending dnsx 0",
                 log,
             )
             self.assertIn(
-                "[phase 3/4 | 90.0%] DNS batch 3/3 complete: "
+                "[phase 3/5 | 80.0%] DNS batch 3/3 complete: "
                 "processed 5/5 (100.0%), resolved 3, removed 2, "
-                "pending dnsx 0",
+                "pending extended 0, pending dnsx 0",
                 log,
             )
 
@@ -478,7 +551,7 @@ class DnsClassificationTest(unittest.TestCase):
                     connection,
                     {"resolvers": ["1.1.1.1", "8.8.8.8"]},
                     dnsx_progress_formatter=lambda fraction: (
-                        f"[phase 4/4 | {90 + 10 * fraction:.1f}%]"
+                        f"[phase 5/5 | {95 + 5 * fraction:.1f}%]"
                     ),
                 )
                 connection.execute(
@@ -526,22 +599,22 @@ class DnsClassificationTest(unittest.TestCase):
                 }.issubset(dnsx_command)
             )
             self.assertIn(
-                "[phase 4/4 | 90.0%] dnsx fallback started: "
+                "[phase 5/5 | 95.0%] dnsx fallback started: "
                 "rechecking 2 domains",
                 progress.getvalue(),
             )
             self.assertIn(
-                "[phase 4/4 | 95.0%] dnsx batch 1/2 complete: "
+                "[phase 5/5 | 97.5%] dnsx batch 1/2 complete: "
                 "processed 1/2 (50.0%), recovered 0, removed 0, unknown 1",
                 progress.getvalue(),
             )
             self.assertIn(
-                "[phase 4/4 | 100.0%] dnsx batch 2/2 complete: "
+                "[phase 5/5 | 100.0%] dnsx batch 2/2 complete: "
                 "processed 2/2 (100.0%), recovered 1, removed 0, unknown 1",
                 progress.getvalue(),
             )
             self.assertIn(
-                "[phase 4/4 | 100.0%] dnsx fallback complete: "
+                "[phase 5/5 | 100.0%] dnsx fallback complete: "
                 "recovered 1, removed 0, unknown 1 kept",
                 progress.getvalue(),
             )
@@ -633,6 +706,247 @@ class DnsClassificationTest(unittest.TestCase):
                     )
                 ),
                 [("dead.example",), ("nodata.example",)],
+            )
+
+
+class ExtendedDnsClassificationTest(unittest.IsolatedAsyncioTestCase):
+    class Resolver:
+        def __init__(self, answers):
+            self.answers = answers
+            self.queries: list[tuple[str, str]] = []
+
+        async def resolve(self, name, rdtype, **_kwargs):
+            key = (str(name).rstrip("."), str(rdtype))
+            self.queries.append(key)
+            answer = self.answers.get(key, [])
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+    @staticmethod
+    def rrset(owner: str, record_type: str, *records: str):
+        return dns.rrset.from_text(
+            f"{owner}.",
+            300,
+            "IN",
+            record_type,
+            *records,
+        )
+
+    async def test_follows_cname_to_global_address(self) -> None:
+        resolver = self.Resolver(
+            {
+                ("tracker.example", "CNAME"): self.rrset(
+                    "tracker.example", "CNAME", "edge.example."
+                ),
+                ("edge.example", "A"): self.rrset(
+                    "edge.example", "A", "93.184.216.34"
+                ),
+            }
+        )
+
+        result = await builder._check_extended_domain(
+            "tracker.example", resolver
+        )
+
+        self.assertEqual(result, ("resolved", "cname"))
+
+    async def test_follows_https_alias_mode(self) -> None:
+        resolver = self.Resolver(
+            {
+                ("tracker.example", "HTTPS"): self.rrset(
+                    "tracker.example", "HTTPS", "0 service.example."
+                ),
+                ("service.example", "AAAA"): self.rrset(
+                    "service.example",
+                    "AAAA",
+                    "2606:4700:4700::1111",
+                ),
+            }
+        )
+
+        result = await builder._check_extended_domain(
+            "tracker.example", resolver
+        )
+
+        self.assertEqual(result, ("resolved", "https"))
+
+    async def test_accepts_only_global_https_ip_hints(self) -> None:
+        global_resolver = self.Resolver(
+            {
+                ("tracker.example", "HTTPS"): self.rrset(
+                    "tracker.example",
+                    "HTTPS",
+                    '1 . ipv4hint="93.184.216.34"',
+                ),
+            }
+        )
+        private_resolver = self.Resolver(
+            {
+                ("tracker.example", "HTTPS"): self.rrset(
+                    "tracker.example",
+                    "HTTPS",
+                    '1 . ipv4hint="127.0.0.1"',
+                ),
+            }
+        )
+
+        self.assertEqual(
+            await builder._check_extended_domain(
+                "tracker.example", global_resolver
+            ),
+            ("resolved", "https-hint"),
+        )
+        self.assertEqual(
+            await builder._check_extended_domain(
+                "tracker.example", private_resolver
+            ),
+            ("negative", None),
+        )
+
+    async def test_keeps_unknown_mandatory_https_parameters_unknown(self) -> None:
+        resolver = self.Resolver(
+            {
+                ("tracker.example", "HTTPS"): self.rrset(
+                    "tracker.example",
+                    "HTTPS",
+                    '1 . mandatory=key65400 key65400="value"',
+                ),
+            }
+        )
+
+        self.assertEqual(
+            await builder._check_extended_domain("tracker.example", resolver),
+            ("unknown", None),
+        )
+
+    async def test_keeps_alias_loops_and_transient_errors_unknown(self) -> None:
+        loop_resolver = self.Resolver(
+            {
+                ("a.example", "CNAME"): self.rrset(
+                    "a.example", "CNAME", "b.example."
+                ),
+                ("b.example", "CNAME"): self.rrset(
+                    "b.example", "CNAME", "a.example."
+                ),
+            }
+        )
+        transient_resolver = self.Resolver(
+            {
+                ("tracker.example", "CNAME"): dns.resolver.NoNameservers(),
+                ("tracker.example", "HTTPS"): dns.resolver.NoNameservers(),
+            }
+        )
+        malformed_resolver = self.Resolver(
+            {
+                ("tracker.example", "CNAME"): dns.exception.FormError(),
+                ("tracker.example", "HTTPS"): dns.exception.FormError(),
+            }
+        )
+
+        self.assertEqual(
+            await builder._check_extended_domain("a.example", loop_resolver),
+            ("unknown", None),
+        )
+        self.assertEqual(
+            await builder._check_extended_domain(
+                "tracker.example", transient_resolver
+            ),
+            ("unknown", None),
+        )
+        self.assertEqual(
+            await builder._check_extended_domain(
+                "tracker.example", malformed_resolver
+            ),
+            ("unknown", None),
+        )
+
+    def test_extended_validation_streams_results_into_dns_tables(self) -> None:
+        with sqlite3.connect(":memory:") as connection:
+            builder._initialize_database(connection)
+            connection.executemany(
+                "INSERT INTO dns_extended_candidates VALUES (?)",
+                [
+                    ("cname.example",),
+                    ("dead.example",),
+                    ("hint.example",),
+                    ("https.example",),
+                    ("transient.example",),
+                ],
+            )
+            connection.execute(
+                "INSERT INTO domains SELECT domain FROM dns_extended_candidates"
+            )
+            outcomes = {
+                "cname.example": ("resolved", "cname"),
+                "dead.example": ("negative", None),
+                "hint.example": ("resolved", "https-hint"),
+                "https.example": ("resolved", "https"),
+                "transient.example": ("unknown", None),
+            }
+
+            async def check(domain, _resolver, **_kwargs):
+                await asyncio.sleep(0)
+                return outcomes[domain]
+
+            progress = StringIO()
+            with (
+                patch.object(builder, "DNS_EXTENDED_BATCH_SIZE", 2),
+                patch.object(builder, "_check_extended_domain", check),
+                redirect_stdout(progress),
+            ):
+                builder._validate_extended_dns_database(
+                    connection,
+                    {"resolvers": ["1.1.1.1", "8.8.8.8"]},
+                    progress_formatter=lambda fraction: (
+                        f"[phase 4/5 | {80 + 15 * fraction:.1f}%]"
+                    ),
+                )
+                connection.execute(
+                    "CREATE TABLE removed(domain TEXT PRIMARY KEY) WITHOUT ROWID"
+                )
+                builder._remove_unresolved_domains(connection)
+
+            self.assertEqual(
+                list(
+                    connection.execute(
+                        "SELECT domain FROM dns_resolved ORDER BY domain"
+                    )
+                ),
+                [
+                    ("cname.example",),
+                    ("hint.example",),
+                    ("https.example",),
+                ],
+            )
+            self.assertEqual(
+                list(
+                    connection.execute(
+                        "SELECT domain FROM dns_extended_unknown"
+                    )
+                ),
+                [("transient.example",)],
+            )
+            self.assertEqual(
+                list(connection.execute("SELECT domain FROM removed")),
+                [("dead.example",)],
+            )
+            log = progress.getvalue()
+            self.assertIn(
+                "[phase 4/5 | 80.0%] Extended DNS started: "
+                "checking 5 domains",
+                log,
+            )
+            self.assertIn(
+                "[phase 4/5 | 86.0%] Extended DNS batch 1/3 complete: "
+                "processed 2/5 (40.0%)",
+                log,
+            )
+            self.assertIn(
+                "[phase 4/5 | 95.0%] Extended DNS complete: "
+                "CNAME 1, HTTPS 1, HTTPS hints 1, removed 1, "
+                "unknown 1 kept",
+                log,
             )
 
 class BuildTest(unittest.TestCase):
@@ -905,46 +1219,50 @@ class BuildTest(unittest.TestCase):
 
             log = output.getvalue()
             self.assertIn(
-                "Starting build: 4 phases "
+                "Starting build: 5 phases "
                 "(download 0-10%, parse 10-30%, "
-                "MassDNS 30-90%, dnsx 90-100%)",
+                "MassDNS 30-80%, extended DNS 80-95%, dnsx 95-100%)",
                 log,
             )
             self.assertIn(
-                "[phase 1/4 | 0.0%] [download 1/1] "
+                "[phase 1/5 | 0.0%] [download 1/1] "
                 "Downloading memory://ads",
                 log,
             )
             self.assertIn(
-                "[phase 1/4 | 10.0%] [download 1/1] "
+                "[phase 1/5 | 10.0%] [download 1/1] "
                 "Downloaded memory://ads",
                 log,
             )
             self.assertIn(
-                "[phase 2/4 | 10.0%] [parse 1/1] "
+                "[phase 2/5 | 10.0%] [parse 1/1] "
                 "Parsing memory://ads",
                 log,
             )
             self.assertIn(
-                "[phase 2/4 | 30.0%] [parse 1/1] "
+                "[phase 2/5 | 30.0%] [parse 1/1] "
                 "Parsed memory://ads: 1 domain",
                 log,
             )
             self.assertIn(
-                "[phase 3/4 | 90.0%] MassDNS validation skipped: "
+                "[phase 3/5 | 80.0%] MassDNS validation skipped: "
                 "retaining 1 unique domain",
                 log,
             )
             self.assertIn(
-                "[phase 4/4 | 100.0%] dnsx fallback skipped",
+                "[phase 4/5 | 95.0%] Extended DNS skipped",
                 log,
             )
             self.assertIn(
-                "[phase 4/4 | 100.0%] Writing blocklist.txt: 1 domain",
+                "[phase 5/5 | 100.0%] dnsx fallback skipped",
                 log,
             )
             self.assertIn(
-                "[phase 4/4 | 100.0%] Build complete in ",
+                "[phase 5/5 | 100.0%] Writing blocklist.txt: 1 domain",
+                log,
+            )
+            self.assertIn(
+                "[phase 5/5 | 100.0%] Build complete in ",
                 log,
             )
 

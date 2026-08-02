@@ -51,17 +51,19 @@ parsed with `dnspython`; only owners redirected by `CNAME .` are treated as
 blocked domains.
 
 The build fails instead of publishing partial output when a configured source,
-the Public Suffix List, or either DNS validator cannot complete.
+the Public Suffix List, or any DNS validation stage cannot complete.
 
 The build logs real completed work without timer heartbeats. Overall progress is
-split into download (0-10%), parse and merge (10-30%), MassDNS (30-90%), and
-dnsx fallback (90-100%). Download and parse advance after each source; MassDNS
-and dnsx advance after each completed batch. dnsx reports recovered, explicitly
-removed, and still-unknown counts, or reports that it was skipped when MassDNS
-produced no unknown domains.
+split into download (0-10%), parse and merge (10-30%), MassDNS (30-80%),
+extended DNS (80-95%), and dnsx fallback (95-100%). Download and parse advance
+after each source; each DNS stage advances after a completed batch. Extended
+DNS reports CNAME, HTTPS, and HTTPS IP-hint recoveries. dnsx reports recovered,
+explicitly removed, and still-unknown counts, or reports that it was skipped
+when MassDNS produced no unknown domains.
 
 MassDNS validation runs in batches of 10,000 domains. After every batch, the
-log reports cumulative processed, resolved, removed, and dnsx-pending counts.
+log reports cumulative processed, resolved, removed, extended-DNS-pending, and
+dnsx-pending counts.
 The dnsx fallback processes batches of 2,000 and logs cumulative processed,
 recovered, explicitly removed, and still-unknown counts. This provides exact
 progress without loading the full domain list into RAM.
@@ -83,12 +85,23 @@ MassDNS first queries A records against the unfiltered resolver pool configured
 in `sources.yaml`, using a hash-map size of 800. AAAA is queried only for names
 without a global A address and without an NXDOMAIN response. Only transient or
 missing results are retried, using the same resolver pool with a lower hash-map
-size of 200. Remaining unknown domains are passed to dnsx in batches, with A and
-AAAA queries, the same resolver pool, and three retries.
+size of 200.
+
+Names for which both A and AAAA return NODATA are checked asynchronously with
+dnspython before removal. The checker follows CNAME and HTTPS AliasMode targets
+for up to eight levels, resolves HTTPS ServiceMode targets, and accepts globally
+routable `ipv4hint` or `ipv6hint` values. Private, loopback, link-local,
+multicast, and reserved addresses do not count. Alias loops, DNS errors, and
+HTTPS records containing unsupported mandatory parameters remain unknown and
+are kept. Generic SVCB type 64 is not queried because this list contains normal
+hostnames rather than service-prefixed names.
+
+Remaining MassDNS transient or missing results are passed to dnsx in batches,
+with A and AAAA queries, the same resolver pool, and three retries.
 
 - A domain with any globally routable A or AAAA answer is kept.
-- NXDOMAIN is removed without an unnecessary AAAA query; NODATA is removed
-  after both A and AAAA return no address.
+- NXDOMAIN is removed without an unnecessary AAAA query. Dual A/AAAA NODATA is
+  removed only when CNAME and HTTPS checks also find no usable endpoint.
 - A domain with timeout, SERVFAIL, REFUSED, or missing MassDNS output is kept
   pending until dnsx rechecks it. If dnsx still returns no global A or AAAA
   address, the domain remains unknown and is kept; missing dnsx output is not

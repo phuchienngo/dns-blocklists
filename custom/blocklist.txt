@@ -4,7 +4,7 @@ socialapi.mservice.com.vn
 socialhub.momo.vn
 socialhub.mservice.com.vn
 social-dev.momocdn.net
-social.momocdn.ne
+social.momocdn.net
 afl.coccoc.com
 afdk.coccoc.com
 metrics.coccoc.com
